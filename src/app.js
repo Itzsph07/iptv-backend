@@ -54,14 +54,26 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Database connection - SIMPLIFIED
+// Database connection with better error handling
+console.log('📡 Attempting to connect to MongoDB...');
+
 mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-  serverSelectionTimeoutMS: 30000
+  serverSelectionTimeoutMS: 30000,
+  connectTimeoutMS: 30000,
+  socketTimeoutMS: 45000
 })
-.then(() => console.log('✅ MongoDB connected'))
-.catch(err => console.error('❌ MongoDB connection error:', err));
+.then(() => {
+  console.log('✅ MongoDB connected successfully!');
+  console.log('📊 Database ready to use');
+})
+.catch(err => {
+  console.error('❌ MongoDB connection error:');
+  console.error('Error name:', err.name);
+  console.error('Error message:', err.message);
+  if (err.reason) {
+    console.error('Error reason:', err.reason);
+  }
+});
 // ========== PROXY STREAM ROUTE (NO AUTH REQUIRED) ==========
 const axios = require('axios');
 
