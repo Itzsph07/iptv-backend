@@ -13,7 +13,7 @@ const adminUser = {
 async function createAdmin() {
   try {
     // Connect to MongoDB
-    await mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/iptv-manager');
+    await mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/iptv_manager');
     console.log('Connected to MongoDB');
 
     // Get the User model (if you have one defined)

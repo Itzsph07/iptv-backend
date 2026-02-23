@@ -1,8 +1,16 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// backend/app.js – PROXY ROUTE with fallback URL formats and detailed error logging
+// backend/app.js – PROXY ROUTE with connection tracking and FORCE KILL
 // ═══════════════════════════════════════════════════════════════════════════
 
 const axios = require('axios');
+const crypto = require('crypto');
+
+// ★★★ Track active connections by a unique ID for precise killing ★★★
+const activeConnections = new Map(); // key: `${mac}_${channelId}` -> { stream, res, timestamp }
+
+// ★ Track URLs currently being fetched — blocks duplicate simultaneous requests
+// (ExoPlayer sends 2 rapid requests for the same URL; the second would cause 458/401)
+const fetchingUrls = new Set();
 
 const XTREAM_USER_AGENTS = [
   'VLC/3.0.18 LibVLC/3.0.18',
@@ -26,9 +34,6 @@ function isXtreamUrl(url) {
   return false;
 }
 
-/**
- * Attempt to fetch with given URL and headers, return response or throw.
- */
 async function attemptFetch(url, headers) {
   return await axios({
     method: 'GET',
@@ -41,27 +46,89 @@ async function attemptFetch(url, headers) {
   });
 }
 
+// ★★★ NEW: Function to forcefully kill a specific stream ★★★
+function killStream(mac, channelId) {
+  const key = `${mac}_${channelId}`;
+  if (activeConnections.has(key)) {
+    const conn = activeConnections.get(key);
+    console.log(`🪓 Force killing stream for MAC: ${mac}, Channel: ${channelId}`);
+
+    // Destroy the incoming stream from the source
+    if (conn.stream && typeof conn.stream.destroy === 'function') {
+      try {
+        conn.stream.destroy();
+      } catch (e) {
+        console.log('⚠️ Error destroying stream:', e.message);
+      }
+    }
+
+    // End the response to the client if it's still writable
+    if (conn.res && !conn.res.writableEnded) {
+      try {
+        conn.res.end();
+      } catch (e) {}
+    }
+
+    activeConnections.delete(key);
+    console.log(`✅ Stream killed for ${key}`);
+    return true;
+  }
+  return false;
+}
+
+// ★★★ NEW: Endpoint to kill a stream, called by your backend ★★★
+app.delete('/api/proxy/stream/:mac/:channelId', (req, res) => {
+  const { mac, channelId } = req.params;
+  console.log(`🔫 Kill request received for MAC: ${mac}, Channel: ${channelId}`);
+
+  const killed = killStream(mac, channelId);
+
+  res.json({
+    success: killed,
+    message: killed ? 'Stream terminated' : 'Stream not found'
+  });
+});
+
 app.get('/api/proxy/stream', async (req, res) => {
   try {
-    let { url, mac, type, ua_index } = req.query;
+    let { url, mac, type, ua_index, channelId } = req.query;
     if (!url) return res.status(400).json({ error: 'URL is required' });
+    if (!channelId) {
+      const match = decodeURIComponent(url).match(/stream=(\d+)/) || decodeURIComponent(url).match(/\/(\d+)(?:\.ts)?$/);
+      channelId = match ? match[1] : 'unknown';
+    }
 
     let decodedUrl = decodeURIComponent(url);
-    const originalUrl = decodedUrl; // keep for fallback
+    const originalUrl = decodedUrl;
 
-    // Determine stream type
+    // ★★★ CRITICAL: Kill any existing stream for this MAC+channel before starting a new one ★★★
+    if (mac && channelId !== 'unknown') {
+      killStream(mac, channelId);
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+
+    // ★ Block duplicate simultaneous requests for the same URL.
+    // ExoPlayer fires 2 rapid requests (preflight + real stream) with the same URL.
+    // If both reach the portal, it sees 2 concurrent streams → 458/401 on the second.
+    // We track URLs currently being fetched and drop any duplicate within 3 seconds.
+    const urlKey = decodedUrl.split('?')[0] + (decodedUrl.match(/[?&](stream|play_token)=[^&]+/g) || []).join('');
+    if (fetchingUrls.has(urlKey)) {
+      console.log(`🚫 Duplicate request blocked for URL: ${urlKey.slice(0, 80)}`);
+      return res.status(429).json({ error: 'Duplicate stream request — already connecting' });
+    }
+    fetchingUrls.add(urlKey);
+    // Auto-remove after 3 seconds regardless (guards against fetch failures)
+    setTimeout(() => fetchingUrls.delete(urlKey), 3000);
+
     const streamType = type || (isXtreamUrl(decodedUrl) ? 'xtream' : 'mag');
     const uaIndex = parseInt(ua_index) || 0;
     const userAgent = XTREAM_USER_AGENTS[uaIndex] || XTREAM_USER_AGENTS[0];
 
-    console.log(`🔌 Proxying stream (${streamType})`);
+    console.log(`🔌 Proxying stream (${streamType}) for MAC: ${mac || 'unknown'}, Channel: ${channelId}`);
     console.log(`   Original URL: ${decodedUrl}`);
-    console.log(`   UA index: ${uaIndex} -> ${userAgent}`);
 
-    // Prepare headers based on type
     let headers;
     if (streamType === 'xtream') {
-      // Ensure .ts extension if missing
       if (!decodedUrl.includes('.ts') && !decodedUrl.includes('.m3u8') && !decodedUrl.includes('.mp4')) {
         const lastSegment = decodedUrl.split('/').pop() || '';
         if (/^\d+$/.test(lastSegment)) {
@@ -74,13 +141,12 @@ app.get('/api/proxy/stream', async (req, res) => {
         'Accept': 'video/mp2t, video/quicktime, video/*, */*',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'identity',
-        'Connection': 'keep-alive',
+        'Connection': 'close',
         'Referer': decodedUrl.substring(0, decodedUrl.indexOf('/', 8)) + '/',
         'Origin': decodedUrl.substring(0, decodedUrl.indexOf('/', 8)),
       };
       if (uaIndex === 0) headers['Icy-MetaData'] = '1';
     } else {
-      // MAG headers (unchanged)
       const macAddress = mac || '00:1A:79:00:00:00';
       headers = {
         'User-Agent': 'Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3',
@@ -88,7 +154,7 @@ app.get('/api/proxy/stream', async (req, res) => {
         'Accept': '*/*',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'identity',
-        'Connection': 'keep-alive',
+        'Connection': 'close',
         'Cookie': `mac=${macAddress}; stb_lang=en; timezone=GMT`,
       };
       try {
@@ -102,27 +168,23 @@ app.get('/api/proxy/stream', async (req, res) => {
       console.log('   Range:', req.headers.range);
     }
 
-    // Try primary URL
     let response;
     try {
       response = await attemptFetch(decodedUrl, headers);
     } catch (err) {
-      // If primary fails with 404 and it's Xtream, try alternate format
+      fetchingUrls.delete(urlKey); // allow retry
       if (streamType === 'xtream' && err.response?.status === 404) {
         console.log('   Primary URL returned 404, trying alternate format...');
-        // If original path is /user/pass/streamid, try /live/user/pass/streamid.ts
         const pathMatch = originalUrl.match(/^(https?:\/\/[^/]+)(\/[^/]+\/[^/]+\/\d+)(\.ts)?$/);
         if (pathMatch) {
           const base = pathMatch[1];
           const path = pathMatch[2];
-          // Remove any trailing .ts from path if present
           const cleanPath = path.replace(/\.ts$/, '');
           const altUrl = base + '/live' + cleanPath + '.ts';
           console.log(`   Trying alternate: ${altUrl}`);
           try {
             response = await attemptFetch(altUrl, headers);
           } catch (altErr) {
-            // If both fail, throw the original error
             throw err;
           }
         } else {
@@ -135,7 +197,21 @@ app.get('/api/proxy/stream', async (req, res) => {
 
     console.log('✅ Stream response:', response.status, response.headers['content-type']);
 
-    // Set response headers
+    // Stream is established — remove from dedup set so a future re-select works
+    fetchingUrls.delete(urlKey);
+
+    // ★★★ Store the connection with composite key (MAC + channelId) ★★★
+    const connectionKey = `${mac}_${channelId}`;
+    activeConnections.set(connectionKey, {
+      stream: response.data,
+      res: res,
+      timestamp: Date.now(),
+      url: decodedUrl,
+      mac: mac,
+      channelId: channelId
+    });
+    console.log(`📦 Stored connection for ${connectionKey}, total active: ${activeConnections.size}`);
+
     const responseHeaders = {
       'Content-Type': response.headers['content-type'] || 'video/mp2t',
       'Cache-Control': 'no-cache, no-store, must-revalidate',
@@ -143,6 +219,7 @@ app.get('/api/proxy/stream', async (req, res) => {
       'Access-Control-Allow-Headers': 'Range',
       'Access-Control-Expose-Headers': 'Content-Length, Content-Range',
       'Accept-Ranges': 'bytes',
+      'Connection': 'close',
     };
     if (response.status === 206) {
       res.status(206);
@@ -154,23 +231,23 @@ app.get('/api/proxy/stream', async (req, res) => {
     res.set(responseHeaders);
     response.data.pipe(res);
 
+    response.data.on('end', () => {
+      console.log(`✅ Stream ended for ${connectionKey}`);
+      activeConnections.delete(connectionKey);
+    });
+
     response.data.on('error', (err) => {
-      console.error('❌ Stream pipe error:', err.message);
+      console.error('❌ Stream pipe error for ${connectionKey}:', err.message);
+      activeConnections.delete(connectionKey);
       if (!res.headersSent) res.status(500).json({ error: 'Streaming failed' });
     });
-    response.data.on('end', () => console.log('✅ Stream ended'));
 
   } catch (error) {
     console.error('❌ Proxy error:', {
       message: error.message,
       code: error.code,
       status: error.response?.status,
-      data: error.response?.data ? '（non‑stream data present）' : undefined,
     });
-    // Log response body if available (for debugging)
-    if (error.response && error.response.data && typeof error.response.data === 'string') {
-      console.error('   Response body:', error.response.data.substring(0, 200));
-    }
     if (!res.headersSent) {
       let status = 500;
       let message = 'Streaming failed: ' + error.message;
@@ -201,3 +278,24 @@ app.options('/api/proxy/stream', (req, res) => {
   });
   res.sendStatus(204);
 });
+
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [key, conn] of activeConnections.entries()) {
+    if (now - conn.timestamp > 5 * 60 * 1000) {
+      console.log(`🧹 Cleaning up stale connection for ${key}`);
+      if (conn.stream && typeof conn.stream.destroy === 'function') {
+        try { conn.stream.destroy(); } catch (e) {}
+      }
+      if (conn.res && !conn.res.writableEnded) {
+        try { conn.res.end(); } catch (e) {}
+      }
+      activeConnections.delete(key);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) {
+    console.log(`✅ Cleaned up ${cleaned} stale connections, remaining: ${activeConnections.size}`);
+  }
+}, 60 * 1000);

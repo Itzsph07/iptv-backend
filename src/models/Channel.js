@@ -1,7 +1,6 @@
 const mongoose = require('mongoose');
 
 const channelSchema = new mongoose.Schema({
-    // MISSING FIELD - Add this!
     channelId: { 
         type: String, 
         required: true 
@@ -33,6 +32,10 @@ const channelSchema = new mongoose.Schema({
         enum: ['m3u', 'mag', 'xtream'],
         default: 'm3u'
     },
+    // ★ NEW: Store the actual streaming token
+    streamingToken: String,
+    // ★ NEW: Store the complete working stream URL
+    streamUrl: String,
     // Additional
     isVisible: { 
         type: Boolean, 

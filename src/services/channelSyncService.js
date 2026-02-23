@@ -50,7 +50,11 @@ class ChannelSyncService {
         case 'mag':
         case 'stalker':
           this.reportProgress('fetching', 10, 100, 'Fetching MAG channels...');
-          const magService = new MagStalkerService(playlist.sourceUrl, playlist.macAddress);
+          const magService = new MagStalkerService(
+            playlist.sourceUrl, 
+            playlist.macAddress,
+            playlist._id.toString() // ★ PASS THE PLAYLIST ID
+          );
           const magData = await magService.syncAll();
           channels = magData.channels || [];
           break;
@@ -173,6 +177,8 @@ class ChannelSyncService {
                 customName: existingSettings?.customName,
                 customLogo: existingSettings?.customLogo,
                 customOrder: existingSettings?.customOrder,
+                streamingToken: channelData.streamingToken,
+                streamUrl: channelData.streamUrl,
                 updatedAt: new Date(),
               },
             },
@@ -190,36 +196,83 @@ class ChannelSyncService {
     console.log(`✅ Database update complete: ${channels.length} channels`);
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // FIXED: getChannelsForCustomer with source playlist tracking
+  // ═══════════════════════════════════════════════════════════════════════
   async getChannelsForCustomer(customerId) {
+    // Get ALL playlists this customer has access to
     const playlists = await Playlist.find({
-      assignedCustomers: customerId,
-      isActive: true,
-    });
+        assignedCustomers: customerId,
+        isActive: true,
+    }).lean();
+
+    console.log(`Customer has access to ${playlists.length} playlists`);
+    
+    // Create a map of accessible playlists
+    const accessiblePlaylists = new Map(
+        playlists.map(p => [p._id.toString(), p])
+    );
 
     let allChannels = [];
 
+    // For EACH playlist the customer has access to
     for (const playlist of playlists) {
-      const channels = await Channel.find({
-        playlistId: playlist._id,
-        isVisible: true,
-      }).lean();
+        // Get ALL visible channels from this playlist
+        const channels = await Channel.find({
+            playlistId: playlist._id,
+            isVisible: true,
+        }).lean();
 
-      const enriched = channels.map(ch => {
-        const settings = playlist.channelSettings?.find(s => s.channelId === ch.channelId.toString());
-        return {
-          ...ch,
-          name: settings?.customName || ch.name,
-          logo: settings?.customLogo || ch.logo,
-          order: settings?.customOrder || 999,
-          playlistName: playlist.name,
-          playlistType: playlist.type,
-        };
-      });
+        console.log(`📺 Playlist ${playlist.name} (${playlist._id}): ${channels.length} channels`);
 
-      allChannels = [...allChannels, ...enriched];
+        // Enrich each channel with playlist data
+        const enriched = channels.map(ch => {
+            const settings = playlist.channelSettings?.find(
+                s => s.channelId === ch.channelId.toString()
+            );
+
+            return {
+                ...ch,
+                name: settings?.customName || ch.name,
+                logo: settings?.customLogo || ch.logo,
+                order: settings?.customOrder || 999,
+                playlistName: playlist.name,
+                playlistType: playlist.type,
+                macAddress: playlist.macAddress,
+                streamingToken: ch.streamingToken,
+                streamUrl: ch.streamUrl,
+                // ★★★ CRITICAL: Store the source playlist info for sync operations
+                sourcePlaylist: {
+                    id: playlist._id.toString(),
+                    name: playlist.name,
+                    type: playlist.type,
+                    macAddress: playlist.macAddress,
+                    sourceUrl: playlist.sourceUrl,
+                    xtreamUsername: playlist.xtreamUsername,
+                    xtreamPassword: playlist.xtreamPassword
+                },
+                // Keep original for reference
+                originalPlaylistId: ch.playlistId
+            };
+        });
+
+        allChannels = [...allChannels, ...enriched];
     }
 
+    // Sort by custom order
     allChannels.sort((a, b) => (a.order || 999) - (b.order || 999));
+    
+    console.log(`Returning ${allChannels.length} channels from ${playlists.length} playlists`);
+    if (allChannels.length > 0) {
+        const sample = allChannels[0];
+        console.log('✅ Sample channel with source playlist:', {
+            name: sample.name,
+            originalPlaylistId: sample.originalPlaylistId,
+            sourcePlaylistId: sample.sourcePlaylist?.id,
+            hasToken: !!sample.streamingToken
+        });
+    }
+    
     return allChannels;
   }
 }

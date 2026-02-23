@@ -4,6 +4,7 @@ const customerController = require('../controllers/customerController');
 const auth = require('../middleware/auth');
 const admin = require('../middleware/admin');
 const ChannelSyncService = require('../services/channelSyncService');
+const Customer = require('../models/Customer');
 
 router.post('/', [auth, admin], customerController.createCustomer);
 router.get('/', [auth, admin], customerController.getCustomers);
@@ -20,11 +21,24 @@ router.get('/my-channels', auth, async (req, res) => {
     const syncService = new ChannelSyncService();
     const channels = await syncService.getChannelsForCustomer(req.user.customerId);
 
+    console.log(`Returning ${channels.length} channels to customer`);
+    if (channels.length > 0) {
+      console.log('Sample channel:', {
+        name: channels[0].name,
+        hasMacAddress: !!channels[0].macAddress,
+        macAddress: channels[0].macAddress,
+        playlistType: channels[0].playlistType,
+        hasStreamingToken: !!channels[0].streamingToken,
+        hasStreamUrl: !!channels[0].streamUrl
+      });
+    }
+
     res.json({
       success: true,
       channels
     });
   } catch (error) {
+    console.error('Error in /my-channels:', error);
     res.status(500).json({
       success: false,
       message: error.message

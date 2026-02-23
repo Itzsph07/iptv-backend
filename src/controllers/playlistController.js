@@ -5,8 +5,8 @@ const ChannelSyncService = require('../services/channelSyncService');
 const MagStalkerService = require('../services/magStalkerService');
 const M3UService = require('../services/m3uService');
 const XtreamService = require('../services/xtreamService');
+const axios = require('axios'); // Make sure to add this if not already installed
 
-// Create playlist
 // Create playlist
 exports.createPlaylist = async (req, res) => {
     try {
@@ -71,7 +71,6 @@ exports.createPlaylist = async (req, res) => {
     }
 };
 
-
 // Get all playlists
 exports.getPlaylists = async (req, res) => {
     try {
@@ -96,6 +95,7 @@ exports.getPlaylists = async (req, res) => {
         });
     }
 };
+
 // Update playlist
 exports.updatePlaylist = async (req, res) => {
     try {
@@ -138,7 +138,6 @@ exports.updatePlaylist = async (req, res) => {
 };
 
 // Delete playlist
-// Delete playlist
 exports.deletePlaylist = async (req, res) => {
     try {
         const { id } = req.params;
@@ -180,6 +179,7 @@ exports.deletePlaylist = async (req, res) => {
         });
     }
 };
+
 // Sync playlist
 exports.syncPlaylist = async (req, res) => {
     try {
@@ -204,16 +204,13 @@ exports.syncPlaylist = async (req, res) => {
 };
 
 // Get channels
-// Get channels - return ALL channels (visible and hidden) for admin editing
 exports.getChannels = async (req, res) => {
     try {
         const { playlistId } = req.params;
         console.log('📺 Fetching ALL channels for playlist:', playlistId);
 
-        // Remove the isVisible filter - get all channels
         const channels = await Channel.find({
             playlistId
-            // isVisible: true  ← REMOVE THIS LINE
         }).sort('customOrder');
 
         console.log(`✅ Found ${channels.length} total channels (visible + hidden)`);
@@ -285,7 +282,6 @@ exports.updateChannelVisibility = async (req, res) => {
 };
 
 // Bulk update channels
-// Bulk update channels - OPTIMIZED VERSION
 exports.bulkUpdateChannels = async (req, res) => {
     try {
         const { playlistId } = req.params;
@@ -386,6 +382,248 @@ exports.testConnection = async (req, res) => {
         res.status(500).json({
             success: false,
             message: error.message
+        });
+    }
+};
+
+// ============================================
+// NEW: Force sync endpoint handler
+// ============================================
+exports.forceSyncPlaylist = async (req, res) => {
+    try {
+        const { playlistId } = req.params;
+        
+        console.log('🔴 Force syncing playlist:', playlistId);
+
+        // Get the playlist
+        const playlist = await Playlist.findById(playlistId);
+        if (!playlist) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Playlist not found' 
+            });
+        }
+
+        // Get all channels for this playlist
+        const channels = await Channel.find({ playlistId }).lean();
+        
+        const results = {
+            total: channels.length,
+            updated: 0,
+            failed: 0,
+            details: []
+        };
+
+        console.log(`🔄 Processing ${channels.length} channels for token refresh...`);
+
+        // Process channels in batches to avoid overwhelming the server
+        const batchSize = 50;
+        for (let i = 0; i < channels.length; i += batchSize) {
+            const batch = channels.slice(i, i + batchSize);
+            console.log(`📦 Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(channels.length/batchSize)}`);
+            
+            await Promise.all(batch.map(async (channel) => {
+                try {
+                    let newToken = null;
+                    
+                    if (playlist.type === 'mag' || playlist.type === 'stalker') {
+                        // For MAG/Stalker portals - use the MAC address from the channel or playlist
+                        const macToUse = channel.macAddress || playlist.macAddress;
+                        if (macToUse) {
+                            newToken = await exports.generateMagToken(playlist, macToUse);
+                        }
+                    } else if (playlist.type === 'xtream') {
+                        // For Xtream codes - refresh the token
+                        newToken = await exports.refreshXtreamToken(playlist, channel);
+                    }
+
+                    if (newToken) {
+                        // Update the channel with new token
+                        await Channel.findOneAndUpdate(
+                            { 
+                                playlistId: playlistId,
+                                channelId: channel.channelId 
+                            },
+                            {
+                                $set: {
+                                    streamingToken: newToken,
+                                    tokenUpdatedAt: new Date()
+                                }
+                            }
+                        );
+                        
+                        results.updated++;
+                        results.details.push({
+                            channelId: channel.channelId,
+                            name: channel.name,
+                            status: 'updated'
+                        });
+                        
+                        console.log(`  ✅ Token updated: ${channel.name}`);
+                    } else {
+                        results.failed++;
+                        results.details.push({
+                            channelId: channel.channelId,
+                            name: channel.name,
+                            status: 'failed',
+                            reason: 'Could not generate token'
+                        });
+                        
+                        console.log(`  ❌ Token failed: ${channel.name}`);
+                    }
+                } catch (channelError) {
+                    console.error(`Error processing channel ${channel.channelId}:`, channelError);
+                    results.failed++;
+                    results.details.push({
+                        channelId: channel.channelId,
+                        name: channel.name,
+                        status: 'error',
+                        reason: channelError.message
+                    });
+                }
+            }));
+        }
+
+        // Update playlist's last sync time
+        await Playlist.findByIdAndUpdate(playlistId, {
+            $set: {
+                lastForceSync: new Date(),
+                lastSync: new Date()
+            }
+        });
+
+        console.log(`✅ Force sync completed: ${results.updated} updated, ${results.failed} failed`);
+
+        res.json({
+            success: true,
+            message: `Force sync completed for playlist ${playlistId}`,
+            results
+        });
+
+    } catch (error) {
+        console.error('❌ Force sync error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+};
+
+// ============================================
+// Token generation helper functions
+// ============================================
+
+// Generate token for MAG/Stalker portal
+exports.generateMagToken = async (playlist, macAddress) => {
+    try {
+        console.log(`🎫 Generating MAG token for MAC: ${macAddress}`);
+        
+        // Option 1: Use the MagStalkerService if it has token generation
+        const magService = new MagStalkerService(playlist.sourceUrl, macAddress);
+        await magService.handshake();
+        
+        // Get token from the service - this depends on your MagStalkerService implementation
+        // You might need to add a getToken() method to the service
+        const token = magService.getToken ? magService.getToken() : `token_${Date.now()}_${macAddress.replace(/:/g, '')}`;
+        
+        return token;
+        
+        // Option 2: If you need to make a direct API call:
+        /*
+        const response = await axios.post(`${playlist.sourceUrl}/stalker_portal/api/v2/auth`, {
+            mac: macAddress,
+            token: playlist.portalToken || ''
+        }, {
+            headers: {
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0'
+            },
+            timeout: 10000
+        });
+        
+        if (response.data && response.data.token) {
+            return response.data.token;
+        }
+        */
+    } catch (error) {
+        console.error('❌ MAG token generation failed:', error.message);
+        return null;
+    }
+};
+
+// Refresh token for Xtream codes
+exports.refreshXtreamToken = async (playlist, channel) => {
+    try {
+        console.log(`🎫 Refreshing Xtream token for: ${channel.name}`);
+        
+        // Option 1: Use the XtreamService
+        const xtreamService = new XtreamService(
+            playlist.sourceUrl, 
+            playlist.xtreamUsername, 
+            playlist.xtreamPassword
+        );
+        
+        // Authenticate to get fresh token
+        const auth = await xtreamService.authenticate();
+        
+        if (auth && auth.user_info) {
+            // Generate a token string (this depends on your XtreamService)
+            const token = `${playlist.xtreamUsername}:${playlist.xtreamPassword}:${Date.now()}`;
+            return Buffer.from(token).toString('base64');
+        }
+        
+        // Option 2: If you need a direct API call for Xtream:
+        /*
+        const response = await axios.get(
+            `${playlist.sourceUrl}/player_api.php`, {
+                params: {
+                    username: playlist.xtreamUsername,
+                    password: playlist.xtreamPassword,
+                    action: 'user'
+                },
+                timeout: 10000
+            }
+        );
+        
+        if (response.data && response.data.user_info) {
+            const token = `${playlist.xtreamUsername}:${playlist.xtreamPassword}:${Date.now()}`;
+            return Buffer.from(token).toString('base64');
+        }
+        */
+        
+        return null;
+    } catch (error) {
+        console.error('❌ Xtream token refresh failed:', error.message);
+        return null;
+    }
+};
+
+// Get single playlist by ID
+exports.getPlaylistById = async (req, res) => {
+    try {
+        const { playlistId } = req.params;
+        console.log('🔍 Fetching playlist by ID:', playlistId);
+        
+        const playlist = await Playlist.findById(playlistId)
+            .populate('assignedCustomers', 'name email macAddress')
+            .lean();
+            
+        if (!playlist) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Playlist not found' 
+            });
+        }
+        
+        res.json({
+            success: true,
+            playlist
+        });
+    } catch (error) {
+        console.error('❌ Error fetching playlist:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
         });
     }
 };

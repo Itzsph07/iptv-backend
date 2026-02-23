@@ -1,12 +1,29 @@
-// backend/routes/channels.js – FIXED with MAG priority
+// backend/src/routes/channels.js
+// COMPLETE FIXED VERSION - WITH PROPER MAG URL CONSTRUCTION
 
 const express  = require('express');
 const router   = express.Router();
 const auth     = require('../middleware/auth');
 const axios    = require('axios');
 const Playlist = require('../models/Playlist');
+const Channel  = require('../models/Channel');
 
-// ─── helpers ─────────────────────────────────────────────────────────────────
+// Cache for successful results
+const linkCache = new Map(); // channelId -> { url, timestamp }
+const sessionMap = new Map(); // macAddress -> { password, timestamp }
+
+// Clean caches every hour
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of linkCache.entries()) {
+    if (now - value.timestamp > 3600000) linkCache.delete(key);
+  }
+  for (const [key, value] of sessionMap.entries()) {
+    if (now - value.timestamp > 3600000) sessionMap.delete(key);
+  }
+}, 3600000);
+
+// ─── Shared helpers ───────────────────────────────────────────────────────────
 
 const MAG_UA =
   'Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 ' +
@@ -43,11 +60,6 @@ function parseMAG(data) {
   return { js: data };
 }
 
-function getStreamId(text) {
-  const m = String(text || '').match(/[?&]stream=(\d+)/);
-  return m ? m[1] : null;
-}
-
 function extractUrl(raw) {
   if (!raw) return null;
   const s = String(raw)
@@ -58,28 +70,20 @@ function extractUrl(raw) {
   return m ? m[0] : null;
 }
 
+function getStreamId(text) {
+  const m = String(text || '').match(/[?&]stream=(\d+)/);
+  return m ? m[1] : null;
+}
+
 function ensureStreamId(url, streamId) {
   if (!url || !streamId) return url;
   try {
     const u = new URL(url);
-    const cur = u.searchParams.get('stream');
-    if (!cur || cur.trim() === '') {
-      u.searchParams.set('stream', streamId);
-      console.log(`🔧 Injected stream=${streamId}`);
-      return u.toString();
-    }
-    return url;
-  } catch (_) {
-    return url.replace(/([?&]stream=)([^&]*)/, `$1${streamId}`);
-  }
+    if (!u.searchParams.get('stream')) u.searchParams.set('stream', streamId);
+    return u.toString();
+  } catch (_) { return url; }
 }
 
-/**
- * Detect if URL is Xtream Codes format:
- *   http://host:port/user/pass/streamId[.ts]
- *   OR
- *   http://host:port/live/user/pass/streamId[.ts]
- */
 function isXtreamUrl(url) {
   if (!url) return false;
   const base  = url.split('?')[0].split('#')[0];
@@ -87,64 +91,30 @@ function isXtreamUrl(url) {
   if (!m) return false;
   const parts = (m[1] || '').split('/').filter(Boolean);
   const last  = parts[parts.length - 1] || '';
-  
-  // Format 1: /live/user/pass/streamId[.ts]  (4 parts)
-  if (parts.length === 4 && parts[0] === 'live') {
-    return /^\d+(\.(ts|m3u8|mp4))?$/i.test(last);
-  }
-  
-  // Format 2: /user/pass/streamId[.ts]  (3 parts, missing /live/)
-  if (parts.length === 3) {
-    return /^\d+(\.(ts|m3u8|mp4))?$/i.test(last);
-  }
-  
+  if (parts.length === 4 && parts[0] === 'live') return /^\d+(\.(ts|m3u8|mp4))?$/i.test(last);
+  if (parts.length === 3)                         return /^\d+(\.(ts|m3u8|mp4))?$/i.test(last);
   return false;
 }
 
-/**
- * Clean Xtream URL:
- *  - Strip query params / fragments
- *  - Ensure .ts extension
- *  - Inject /live/ if missing
- *  - Preserve port :80 / :8080
- */
 function cleanXtreamUrl(url) {
-  // 1. Strip query & fragment
   let clean = url.split('?')[0].split('#')[0].trim().replace(/\/$/, '');
-
-  // 2. Parse path to inject /live/ if needed
   const m = clean.match(/^(https?:\/\/[^/]+)(\/.*)?$/);
   if (m) {
-    const base = m[1];
-    const path = m[2] || '';
-    const parts = path.split('/').filter(Boolean);
-    
-    // Check if /live/ is missing
+    const base  = m[1];
+    const parts = (m[2] || '').split('/').filter(Boolean);
     if (parts.length === 3 && parts[0] !== 'live') {
-      // Format: /user/pass/streamId  →  /live/user/pass/streamId
-      const [user, pass, streamId] = parts;
-      clean = `${base}/live/${user}/${pass}/${streamId}`;
-      console.log(`🔧 Injected /live/ into Xtream URL`);
-    } else if (parts.length === 4 && parts[0] === 'live') {
-      // Already has /live/, keep as-is
-      clean = `${base}/${parts.join('/')}`;
+      clean = `${base}/live/${parts[0]}/${parts[1]}/${parts[2]}`;
     } else {
-      // Unexpected format, return as-is
-      clean = base + path;
+      clean = base + (m[2] || '');
     }
   }
-
-  // 3. Ensure .ts extension
-  if (!/\.(ts|m3u8|mp4)$/i.test(clean)) {
-    clean += '.ts';
-  }
-
+  if (!/\.(ts|m3u8|mp4)$/i.test(clean)) clean += '.ts';
   return clean;
 }
 
-// Replace the API_PATHS array with this expanded list
+// Known MAG portal paths — tried in order until one returns a token
 const API_PATHS = [
-  '/portal.php',                    // This worked in your test!
+  '/portal.php',
   '/c/portal.php',
   '/server/load.php',
   '/c/server/load.php',
@@ -153,61 +123,120 @@ const API_PATHS = [
   '/api/portal.php',
   '/c/api/portal.php',
   '/load.php',
-  '/c/load.php'
+  '/c/load.php',
 ];
 
+// ─── doHandshake ──────────────────────────────────────────────────────────────
 async function doHandshake(baseUrl, mac) {
-  console.log(`🔍 Testing handshake paths for ${baseUrl}...`);
-  
   for (const path of API_PATHS) {
     try {
-      const fullUrl = `${baseUrl}${path}`;
-      console.log(`   Testing: ${fullUrl}`);
-      
-      const r = await axios.get(fullUrl, {
-        params:  { 
-          type: 'stb', 
-          action: 'handshake', 
-          token: '', 
-          JsHttpRequest: '1-xml' 
-        },
+      const r = await axios.get(`${baseUrl}${path}`, {
+        params:  { type: 'stb', action: 'handshake', token: '', JsHttpRequest: '1-xml' },
         headers: makeMagHeaders(mac, null, baseUrl),
         timeout: 8000,
-        validateStatus: (status) => status < 500
+        validateStatus: s => s < 500,
       });
-      
-      console.log(`   → Status: ${r.status}`);
-      
       if (r.status === 200) {
-        const d = parseMAG(r.data);
+        const d     = parseMAG(r.data);
         const token = d?.js?.token ?? d?.token;
-        
         if (token) {
-          console.log(`✅✅✅ Handshake SUCCESS at ${path}, NEW TOKEN: ${token}`);
+          console.log(`✅ Handshake OK → ${path}  token: ${token.substring(0, 8)}...`);
           return { token, apiPath: path };
-        } else {
-          console.log(`   ⚠️ No token in response from ${path}`);
         }
-      } else if (r.status === 401) {
-        console.log(`   ⚠️ Path ${path} returned 401 -可能需要认证`);
       }
     } catch (e) {
-      console.log(`   ❌ ${path} failed: ${e.message}`);
+      console.log(`   ❌ ${path}: ${e.message}`);
     }
   }
-  
   console.warn('⚠️  All handshake paths failed');
   return { token: null, apiPath: API_PATHS[0] };
 }
 
+// ─── doGetProfile ─────────────────────────────────────────────────────────────
+async function doGetProfile(baseUrl, apiPath, mac, token) {
+  try {
+    const r = await axios.get(`${baseUrl}${apiPath}`, {
+      params: {
+        type:           'stb',
+        action:         'get_profile',
+        hd:             1,
+        ver:            'ImageDescription: 0.2.18-r14-pub-250',
+        num_banks:      2,
+        sn:             '313356B172963',
+        stb_type:       'MAG250',
+        image_version:  '218',
+        video_out:      'hdmi',
+        device_id:      '', device_id2: '', signature: '',
+        JsHttpRequest:  '1-xml',
+        ...(token ? { token } : {}),
+      },
+      headers: makeMagHeaders(mac, token, baseUrl),
+      timeout: 10000,
+    });
+    const d = parseMAG(r.data);
+    const password = d?.js?.password ?? null;
+    if (password) console.log(`✅ Got profile.password: ${String(password).substring(0, 8)}...`);
+    return password;
+  } catch (e) {
+    console.warn('   doGetProfile error:', e.message);
+    return null;
+  }
+}
+
+// ─── doReleaseStream ─────────────────────────────────────────────────────────
+async function doReleaseStream(baseUrl, apiPath, mac, token, oldCmd) {
+  if (!oldCmd) return;
+  try {
+    let releaseCmd = oldCmd;
+    if (typeof oldCmd === 'string') {
+      releaseCmd = oldCmd.replace(/^ff(mpeg|rt)\s+/i, '').trim();
+      const channelMatch = releaseCmd.match(/stream=(\d+)/) || releaseCmd.match(/\/(\d+)$/);
+      if (channelMatch) {
+        releaseCmd = channelMatch[1];
+      }
+    }
+    
+    console.log(`🔓 Releasing previous session with channel ID: ${releaseCmd}`);
+    await axios.get(`${baseUrl}${apiPath}`, {
+      params: {
+        type:          'itv',
+        action:        'get_ordered_list',
+        cmd:           releaseCmd,
+        genre:         '*',
+        force_ch_link_check: 0,
+        JsHttpRequest: '1-xml',
+        ...(token ? { token } : {}),
+      },
+      headers: makeMagHeaders(mac, token, baseUrl),
+      timeout: 5000,
+    });
+    await new Promise(r => setTimeout(r, 500));
+    console.log('   ✅ Session released');
+  } catch (e) {
+    console.warn('   ⚠️ Release failed (non-fatal):', e.message);
+  }
+}
+
+// ─── doCreateLink ─────────────────────────────────────────────────────────────
 async function doCreateLink(baseUrl, apiPath, mac, token, cmdArg) {
   try {
-    console.log(`🔗 create_link  cmd="${String(cmdArg).slice(0, 120)}"`);
+    console.log(`🔗 create_link for channel ID: ${cmdArg}`);
+    
+    let channelId = cmdArg;
+    if (typeof cmdArg === 'string') {
+      const streamMatch = cmdArg.match(/stream=(\d+)/);
+      if (streamMatch) channelId = streamMatch[1];
+      else {
+        const idMatch = cmdArg.match(/\/(\d+)$/);
+        if (idMatch) channelId = idMatch[1];
+      }
+    }
+    
     const r = await axios.get(`${baseUrl}${apiPath}`, {
       params: {
         type:           'itv',
         action:         'create_link',
-        cmd:            cmdArg,
+        cmd:            channelId,
         series:         0,
         forced_storage: 0,
         disable_ad:     0,
@@ -218,10 +247,17 @@ async function doCreateLink(baseUrl, apiPath, mac, token, cmdArg) {
       timeout: 10000,
     });
     
-    console.log('🔍 RAW create_link response data:', r.data);
+    const d = parseMAG(r.data);
+    let out = d?.js?.cmd ?? d?.js?.url ?? null;
     
-    const d   = parseMAG(r.data);
-    const out = d?.js?.cmd ?? d?.js?.url ?? null;
+    if (out && typeof out === 'string') {
+      out = out.replace(/^ff(mpeg|rt)\s+/i, '').trim();
+      const urlMatch = out.match(/https?:\/\/[^\s"']+/);
+      if (urlMatch) {
+        out = urlMatch[0];
+      }
+    }
+    
     console.log(`   → "${String(out).slice(0, 120)}"`);
     return out;
   } catch (e) {
@@ -230,12 +266,216 @@ async function doCreateLink(baseUrl, apiPath, mac, token, cmdArg) {
   }
 }
 
-// ─── route ────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /channels/channel-switch
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/channel-switch', auth, async (req, res) => {
+    const { playlistId, channelId } = req.body;
+    try {
+        const playlist = await Playlist.findById(playlistId).lean();
+        if (!playlist) return res.status(404).json({ success: false, message: 'Playlist not found' });
 
+        const isMag = playlist.type === 'mag' || playlist.type === 'stalker';
+
+        if (isMag) {
+            const MagStalkerService = require('../services/magStalkerService');
+            const service = new MagStalkerService(playlist.sourceUrl, playlist.macAddress);
+            const tokenData = await service.getChannelToken(channelId);
+
+            if (tokenData?.url) {
+                console.log(`⚡ Cache hit: using stored URL for channel ${channelId}`);
+                return res.json({ success: true, url: tokenData.url, type: 'mag_cached' });
+            } else if (tokenData?.token) {
+                const channel = await Channel.findOne({ playlistId, channelId }).lean();
+                if (channel?.cmd) {
+                    const baseMatch    = channel.cmd.match(/(https?:\/\/[^/]+)/);
+                    const usernameMatch = channel.cmd.match(/https?:\/\/[^/]+\/([^/]+)/);
+                    if (baseMatch && usernameMatch) {
+                        const url = `${baseMatch[1]}/${usernameMatch[1]}/${tokenData.token}/${channelId}.ts`;
+                        return res.json({ success: true, url, type: 'mag_token' });
+                    }
+                }
+            }
+        }
+
+        const channel = await Channel.findOne({ playlistId, channelId }).lean();
+        if (channel?.cmd) {
+            const urlMatch = channel.cmd.match(/https?:\/\/[^\s]+/);
+            if (urlMatch) return res.json({ success: true, url: urlMatch[0], type: 'fallback' });
+        }
+
+        return res.status(404).json({ success: false, message: 'Channel not found' });
+    } catch (error) {
+        console.error('channel-switch error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /channels/get-stalker-token
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/get-stalker-token', auth, async (req, res) => {
+  const { playlistId } = req.body;
+  try {
+    const playlist = await Playlist.findById(playlistId).lean();
+    if (!playlist) return res.status(404).json({ success: false, message: 'Playlist not found' });
+    const { token } = await doHandshake(playlist.sourceUrl, playlist.macAddress);
+    if (token) return res.json({ success: true, token });
+    throw new Error('No token from handshake');
+  } catch (err) {
+    console.error('get-stalker-token error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★  POST /channels/get-stream-single - FIXED VERSION
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/get-stream-single', auth, async (req, res) => {
+  const { playlistId, channelId, cmd } = req.body;
+
+  console.log('\n══════════ get-stream-single ══════════');
+  console.log('channelId :', channelId);
+  console.log('cmd       :', String(cmd || '').slice(0, 120));
+
+  try {
+    const playlist = await Playlist.findById(playlistId).lean();
+    if (!playlist) return res.status(404).json({ success: false, message: 'Playlist not found' });
+
+    const pType = playlist.type;
+    console.log('Playlist type:', pType);
+
+    // ── MAG / STALKER ─────────────────────────────────────────────────────────
+    if (pType === 'mag' || pType === 'stalker') {
+      if (!playlist.sourceUrl || !playlist.macAddress) {
+        return res.status(400).json({ success: false, message: 'Playlist missing sourceUrl or macAddress' });
+      }
+
+      // Check per-channel cache first
+      const cached = linkCache.get(channelId);
+      if (cached && (Date.now() - cached.timestamp < 300000)) {
+        console.log(`⚡ Using cached link for channel ${channelId}`);
+        return res.json({ success: true, url: cached.url, type: 'mag_cached' });
+      }
+
+      try {
+        // Get or create session for this MAC
+        const sessionKey = playlist.macAddress;
+        let sessionPassword = sessionMap.get(sessionKey)?.password;
+        
+        // Check if session exists and is valid (10 minutes)
+        if (!sessionPassword || (Date.now() - sessionMap.get(sessionKey)?.timestamp > 600000)) {
+          console.log(`🔑 Creating new session for MAC: ${playlist.macAddress}`);
+          
+          // Fresh handshake
+          const { token, apiPath } = await doHandshake(playlist.sourceUrl, playlist.macAddress);
+          
+          // Get session password
+          sessionPassword = await doGetProfile(playlist.sourceUrl, apiPath, playlist.macAddress, token);
+          
+          if (sessionPassword) {
+            sessionMap.set(sessionKey, {
+              password: sessionPassword,
+              timestamp: Date.now()
+            });
+            console.log(`✅ Session password set: ${sessionPassword.substring(0, 8)}...`);
+          }
+        } else {
+          console.log(`⚡ Using existing session for MAC: ${playlist.macAddress}`);
+        }
+
+        if (!sessionPassword) {
+          throw new Error('Could not obtain session password');
+        }
+
+        // Check if this is a live.php portal (MAG) or Xtream-style
+        const baseUrl = playlist.sourceUrl.replace(/\/+$/, '');
+        
+        let freshUrl;
+        
+        if (baseUrl.includes('live.php') || cmd.includes('live.php')) {
+          // MAG portal - construct proper live.php URL
+          // Remove the extra /c/ by ensuring we don't duplicate paths
+const basePath = baseUrl.endsWith('/c') ? baseUrl.slice(0, -2) : baseUrl;
+const urlObj = new URL(`${basePath}/play/live.php`);
+          urlObj.searchParams.set('mac', playlist.macAddress);
+          urlObj.searchParams.set('stream', channelId);
+          urlObj.searchParams.set('extension', 'ts');
+          urlObj.searchParams.set('play_token', sessionPassword);
+          freshUrl = urlObj.toString();
+          console.log(`✅ Constructed MAG URL: ${freshUrl}`);
+        } else {
+          // Xtream-style portal
+          const baseMatch = cmd.match(/(https?:\/\/[^\/]+):80\/([^\/]+)\//);
+          if (!baseMatch) {
+            throw new Error('Could not parse base URL from cmd');
+          }
+          const protocol = baseMatch[1];
+          const username = baseMatch[2];
+          freshUrl = `${protocol}/${username}/${sessionPassword}/${channelId}`;
+          console.log(`✅ Constructed Xtream URL: ${freshUrl}`);
+        }
+        
+        // Cache this specific channel's URL
+        linkCache.set(channelId, { url: freshUrl, timestamp: Date.now() });
+        
+        return res.json({ success: true, url: freshUrl, type: 'mag' });
+
+      } catch (magErr) {
+        console.error('❌ MAG error:', magErr.message);
+        const channelDoc = await Channel.findOne({ playlistId, channelId }).lean();
+        const fallback = extractUrl(channelDoc?.cmd) || channelDoc?.url || extractUrl(cmd);
+        if (fallback) {
+          return res.json({ success: true, url: fallback, type: 'mag_fallback' });
+        }
+        return res.status(502).json({ success: false, message: magErr.message });
+      }
+    }
+
+    // ── XTREAM — zero network calls ───────────────────────────────────────────
+    if (pType === 'xtream') {
+      const baseUrl  = (playlist.sourceUrl || '').replace(/\/+$/, '');
+      const username = playlist.xtreamUsername;
+      const password = playlist.xtreamPassword;
+
+      if (baseUrl && username && password) {
+        const url = `${baseUrl}/live/${username}/${password}/${channelId}.ts`;
+        console.log('✅ Xtream URL (instant):', url);
+        return res.json({ success: true, url, type: 'xtream' });
+      }
+
+      const fallback = extractUrl(cmd);
+      if (fallback) {
+        return res.json({ success: true, url: cleanXtreamUrl(fallback), type: 'xtream_fallback' });
+      }
+      return res.status(400).json({ success: false, message: 'Xtream playlist missing credentials' });
+    }
+
+    // ── M3U — zero network calls ──────────────────────────────────────────────
+    if (pType === 'm3u') {
+      const channelDoc = await Channel.findOne({ playlistId, channelId }).lean();
+      const url        = channelDoc?.url || extractUrl(cmd);
+      if (url) {
+        console.log('✅ M3U URL (stored):', url);
+        return res.json({ success: true, url, type: 'm3u' });
+      }
+      return res.status(400).json({ success: false, message: 'No URL found for M3U channel' });
+    }
+
+    return res.status(400).json({ success: false, message: `Unknown playlist type: ${pType}` });
+
+  } catch (err) {
+    console.error('get-stream-single error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /channels/get-stream
+// ─────────────────────────────────────────────────────────────────────────────
 router.post('/get-stream', auth, async (req, res) => {
   try {
     const { playlistId, channelId, cmd } = req.body;
-
     console.log('\n══════════ get-stream ══════════');
     console.log('channelId :', channelId);
     console.log('cmd       :', cmd);
@@ -243,129 +483,122 @@ router.post('/get-stream', auth, async (req, res) => {
     const rawUrl   = extractUrl(cmd);
     const streamId = getStreamId(cmd) || channelId;
 
-    console.log('rawUrl    :', rawUrl);
-    console.log('streamId  :', streamId);
-
-    // ── Get playlist ──────────────────────────────────────────────────────
     const playlist = await Playlist.findById(playlistId).lean();
-    if (!playlist) {
-      return res.status(404).json({ success: false, message: 'Playlist not found' });
-    }
+    if (!playlist) return res.status(404).json({ success: false, message: 'Playlist not found' });
 
-    // Log playlist details
-    console.log('Playlist type:', playlist.type);
-    console.log('sourceUrl:', playlist.sourceUrl);
-    console.log('macAddress:', playlist.macAddress);
+    const isMag = playlist.type === 'mag' || playlist.type === 'stalker';
 
-// ═══════════════════════════════════════════════════════════════════════
-// PRIORITY 1: MAG/STALKER PLAYLIST - CACHED CHANNEL FETCH
-// ═══════════════════════════════════════════════════════════════════════
-const isMag = playlist?.type === 'mag' || playlist?.type === 'stalker';
-
-if (isMag && playlist?.sourceUrl && playlist?.macAddress) {
-  console.log('\n📡 PRIORITY 1: MAG PLAYLIST - Getting channel URL');
-  console.log('   channelId:', channelId);
-
-  try {
-    const MagStalkerService = require('../services/magStalkerService');
-    const service = new MagStalkerService(playlist.sourceUrl, playlist.macAddress);
-    
-    // Use the cached method - first request slow, rest instant
-    const freshUrl = await service.getCachedChannelUrl(channelId);
-    
-    if (freshUrl) {
-      console.log('✅✅✅ FRESH URL:', freshUrl);
-      
-      // Extract and show the token
-      const tokenMatch = freshUrl.match(/\/([^\/]+)\/\d+/);
-      if (tokenMatch) {
-        console.log(`   🔑 Fresh token: ${tokenMatch[1]}`);
-      }
-      
-      return res.json({ success: true, url: freshUrl, type: 'mag' });
-    }
-    
-    console.log('⚠️ Channel not found, falling back');
-    if (rawUrl) {
-      return res.json({ success: true, url: rawUrl, type: 'mag_fallback' });
-    }
-    
-  } catch (error) {
-    console.error('❌ Error:', error.message);
-    if (rawUrl) {
-      return res.json({ success: true, url: rawUrl, type: 'mag_fallback' });
-    }
-  }
-}
-    // ── CASE 1: External Xtream URL (different host) ──────────────────────
-    if (rawUrl && rawHost && playlistHost && rawHost !== playlistHost) {
-      // Add .ts extension if missing (Xtream servers often need it)
-      let finalUrl = rawUrl;
-      if (isXtreamUrl(rawUrl) && !rawUrl.includes('.ts') && !rawUrl.includes('.m3u8') && !rawUrl.includes('.mp4')) {
-        const lastSegment = rawUrl.split('/').pop() || '';
-        if (/^\d+$/.test(lastSegment)) {
-          finalUrl = rawUrl + '.ts';
-          console.log('🔧 Added .ts extension to external Xtream URL');
+    if (isMag && playlist.sourceUrl && playlist.macAddress) {
+      try {
+        const MagStalkerService = require('../services/magStalkerService');
+        const service = new MagStalkerService(playlist.sourceUrl, playlist.macAddress);
+        const channelData = await service.getCachedChannelData(channelId);
+        if (channelData?.streamUrl) {
+          return res.json({ success: true, url: channelData.streamUrl, type: 'mag_cached' });
+        } else if (channelData?.cmd) {
+          const m = channelData.cmd.match(/https?:\/\/[^\s]+/);
+          if (m) return res.json({ success: true, url: m[0], type: 'mag_cached' });
         }
+        if (rawUrl) return res.json({ success: true, url: rawUrl, type: 'mag_fallback' });
+      } catch (error) {
+        if (rawUrl) return res.json({ success: true, url: rawUrl, type: 'mag_fallback' });
       }
-      console.log('✅ External Xtream URL detected → using:', finalUrl);
+    }
+
+    let rawHost = null, playlistHost = null;
+    try { rawHost      = rawUrl ? new URL(rawUrl).hostname         : null; } catch (_) {}
+    try { playlistHost = playlist.sourceUrl ? new URL(playlist.sourceUrl).hostname : null; } catch (_) {}
+
+    if (rawUrl && rawHost && playlistHost && rawHost !== playlistHost) {
+      let finalUrl = rawUrl;
+      if (isXtreamUrl(rawUrl) && !/\.(ts|m3u8|mp4)$/i.test(rawUrl)) {
+        if (/^\d+$/.test(rawUrl.split('/').pop() || '')) finalUrl += '.ts';
+      }
       return res.json({ success: true, url: finalUrl, type: 'xtream' });
     }
 
-    // ── CASE 2: Same-host Xtream URL ──────────────────────────────────────
     if (rawUrl && isXtreamUrl(rawUrl)) {
-      // Try playlist credentials first
-      if (playlist.sourceUrl) {
-        const baseUrl = playlist.sourceUrl.replace(/\/+$/, '');
-        const username = playlist.xtreamUsername || playlist.username;
-        const password = playlist.xtreamPassword || playlist.password;
-        
-        if (username && password) {
-          const xtreamUrl = `${baseUrl}/live/${username}/${password}/${streamId}.ts`;
-          console.log('✅ Xtream URL (from playlist credentials):', xtreamUrl);
-          return res.json({ success: true, url: xtreamUrl, type: 'xtream' });
-        }
+      if (playlist.sourceUrl && (playlist.xtreamUsername || playlist.username)) {
+        const base = playlist.sourceUrl.replace(/\/+$/, '');
+        const user = playlist.xtreamUsername || playlist.username;
+        const pass = playlist.xtreamPassword || playlist.password;
+        return res.json({ success: true, url: `${base}/live/${user}/${pass}/${streamId}.ts`, type: 'xtream' });
       }
-
-      // Fallback to cleaned raw URL
-      const xtreamUrl = cleanXtreamUrl(rawUrl);
-      console.log('✅ Xtream URL (fallback from raw):', xtreamUrl);
-      return res.json({ success: true, url: xtreamUrl, type: 'xtream' });
+      return res.json({ success: true, url: cleanXtreamUrl(rawUrl), type: 'xtream' });
     }
 
-    // ── CASE 3: Xtream playlist type (legacy check) ───────────────────────
-    const isXtreamPlaylist = playlist?.type === 'xtream';
-
-    if (isXtreamPlaylist) {
-      const baseUrl  = playlist.sourceUrl?.replace(/\/+$/, '');
-      const username = playlist.xtreamUsername || playlist.username;
-      const password = playlist.xtreamPassword || playlist.password;
-
-      if (baseUrl && username && password) {
-        const xtreamUrl = `${baseUrl}/live/${username}/${password}/${channelId}.ts`;
-        console.log('✅ Xtream playlist → returning:', xtreamUrl);
-        return res.json({ success: true, url: xtreamUrl, type: 'xtream' });
+    if (playlist.type === 'xtream') {
+      const base = playlist.sourceUrl?.replace(/\/+$/, '');
+      const user = playlist.xtreamUsername || playlist.username;
+      const pass = playlist.xtreamPassword || playlist.password;
+      if (base && user && pass) {
+        return res.json({ success: true, url: `${base}/live/${user}/${pass}/${channelId}.ts`, type: 'xtream' });
       }
-
-      if (rawUrl) {
-        const cleaned = cleanXtreamUrl(rawUrl);
-        console.log('✅ Xtream fallback URL:', cleaned);
-        return res.json({ success: true, url: cleaned, type: 'xtream' });
-      }
+      if (rawUrl) return res.json({ success: true, url: cleanXtreamUrl(rawUrl), type: 'xtream' });
     }
 
-    // ── CASE 4: Final fallback ────────────────────────────────────────────
-    if (!rawUrl) {
-      return res.status(400).json({ success: false, message: 'No valid URL in cmd' });
-    }
-
-    const safeUrl = ensureStreamId(rawUrl, streamId);
-    console.log('ℹ️  Fallback URL:', safeUrl);
-    return res.json({ success: true, url: safeUrl });
+    if (!rawUrl) return res.status(400).json({ success: false, message: 'No valid URL in cmd' });
+    return res.json({ success: true, url: ensureStreamId(rawUrl, streamId) });
 
   } catch (err) {
     console.error('get-stream error:', err);
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /channels/release-stream - Client requests stream release
+// ★★★ COMPLETELY FIXED VERSION ★★★
+router.post('/release-stream', auth, async (req, res) => {
+  const { playlistId, channelId, cmd } = req.body;
+  
+  try {
+    console.log(`🔓 Client requested release for channel ${channelId}`);
+    
+    const playlist = await Playlist.findById(playlistId).lean();
+    if (!playlist) return res.json({ success: true });
+    
+    // Only proceed for MAG portals
+    if (playlist.type === 'mag' || playlist.type === 'stalker') {
+      // Try to do a proper release on the portal
+      try {
+        // Quick handshake to get a token
+        const { token, apiPath } = await doHandshake(playlist.sourceUrl, playlist.macAddress)
+          .catch(() => ({ token: null, apiPath: API_PATHS[0] }));
+        
+        if (token) {
+          await doReleaseStream(playlist.sourceUrl, apiPath, playlist.macAddress, token, cmd);
+        }
+      } catch (e) {
+        console.log('⚠️ Release handshake failed:', e.message);
+      }
+
+      // ★★★ CRITICAL: Force kill any active stream for this MAC ★★★
+      try {
+        const axios = require('axios');
+        const proxyUrl = `http://localhost:${process.env.PORT || 5000}/api/proxy/stream/${playlist.macAddress}/${channelId}`;
+        
+        console.log(`🔫 Force killing stream via proxy: ${proxyUrl}`);
+        await axios.delete(proxyUrl, { timeout: 3000 }).catch(() => {});
+      } catch (e) {
+        console.log('⚠️ Proxy kill request failed (non-fatal):', e.message);
+      }
+
+      // Clear session and cache
+      const mac = playlist.macAddress;
+      if (mac) {
+        sessionMap.delete(mac);
+        console.log(`🗑️ Cleared stale session for MAC: ${mac}`);
+      }
+
+      linkCache.clear();
+      console.log(`🗑️ Cleared entire link cache after release`);
+    }
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Release stream error:', error);
+    res.json({ success: true }); // Always return success
   }
 });
 

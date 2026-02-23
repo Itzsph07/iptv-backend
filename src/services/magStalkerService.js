@@ -2,7 +2,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 
 class MagStalkerService {
-    constructor(baseUrl, macAddress) {
+    constructor(baseUrl, macAddress, playlistId = null) {
         // Handle both string and object inputs
         this.baseUrl = baseUrl && baseUrl.Url ? baseUrl.Url : baseUrl;
         
@@ -12,21 +12,23 @@ class MagStalkerService {
         }
         
         this.macAddress = macAddress;
+        this.playlistId = playlistId; // ★ NEW: Store playlistId for database updates
         this.token = null;
         this.cookie = `mac=${macAddress}; stb_lang=en; timezone=GMT`;
         this.userAgent = 'Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3';
         this.genresMap = new Map();
 
-        // ===== ADD THESE LINES =====
+        // Cache settings
         this.channelsCache = null;           // Store all channels
         this.cacheTimestamp = null;           // When cache was last updated
-        this.cacheTTL = 5 * 60 * 1000;        // Cache for 5 minutes
-        // ===========================
+        this.cacheTTL = 10 * 60 * 1000;       // Cache for 10 minutes
         
+        // Token cache for ultra-fast access
+        this.tokenCache = new Map();           // channelId -> { token, url, timestamp }
+        this.tokenCacheTTL = 10 * 60 * 1000;   // 10 minutes
         
         // Common API paths to try
         this.apiPaths = [
-            // Portal.php paths (based on HTML response)
             '/c/portal.php',
             '/portal.php',
             '/c/server/portal.php',
@@ -35,8 +37,6 @@ class MagStalkerService {
             '/server/portal.php',
             '/api/portal.php',
             '/c/api/portal.php',
-            
-            // Original load.php paths
             '/server/load.php',
             '/c/server/load.php',
             '/stalker_portal/server/load.php',
@@ -44,16 +44,184 @@ class MagStalkerService {
             '/api/server/load.php',
             '/stb/server/load.php',
             '/load.php',
-            
-            // Additional paths
             '/stalker_portal/api/load.php',
             '/api/load.php',
             '/portal/load.php',
             '/xmltv/server/load.php',
             '/itv/server/load.php',
-            '' // Try empty path (direct base URL)
+            ''
         ];
-        this.currentApiPath = '/c/portal.php'; // Default changed to portal.php
+        this.currentApiPath = '/c/portal.php';
+        
+        // Start background sync
+        this._initBackgroundSync();
+    }
+
+    _initBackgroundSync() {
+        // Only run once globally
+        if (typeof global.magStalkerSyncRunning === 'undefined') {
+            global.magStalkerSyncRunning = false;
+        }
+        
+        if (!global.magStalkerSyncRunning) {
+            global.magStalkerSyncRunning = true;
+            this._runBackgroundSync();
+        }
+    }
+    
+    // ★★★ FIXED: Background sync now saves tokens to database ★★★
+    async _runBackgroundSync() {
+        console.log('🔄 Starting background channel sync every 10 minutes...');
+        
+        const syncLoop = async () => {
+            try {
+                console.log('📡 Background sync running...');
+                const startTime = Date.now();
+                
+                const result = await this.syncAll();
+                
+                // ★★★ CRITICAL: Save tokens to database ★★★
+                if (result.channels && result.channels.length > 0 && this.playlistId) {
+                    console.log(`🎯 Got ${result.channels.length} channels from sync`);
+                    
+                    // Count channels with tokens
+                    const channelsWithTokens = result.channels.filter(c => c.streamingToken);
+                    console.log(`🔑 Found ${channelsWithTokens.length} channels with tokens`);
+                    
+                    if (channelsWithTokens.length > 0) {
+                        // Show sample token
+                        console.log('Sample token:', {
+                            channel: channelsWithTokens[0].name,
+                            token: channelsWithTokens[0].streamingToken?.substring(0, 10) + '...'
+                        });
+                        
+                        // ★★★ SAVE TO DATABASE ★★★
+                        const savedCount = await this.saveTokensToDatabase(this.playlistId, result.channels);
+                        
+                        // Update token cache with fresh tokens
+                        let cacheUpdated = 0;
+                        for (const channel of result.channels) {
+                            if (channel.streamingToken || channel.streamUrl) {
+                                this.tokenCache.set(channel.channelId, {
+                                    token: channel.streamingToken,
+                                    url: channel.streamUrl,
+                                    timestamp: Date.now()
+                                });
+                                cacheUpdated++;
+                            }
+                        }
+                        
+                        console.log(`✅ Background sync completed in ${(Date.now() - startTime)/1000}s`);
+                        console.log(`   📦 Cache: ${cacheUpdated} tokens`);
+                        console.log(`   💾 Database: ${savedCount} tokens saved`);
+                    } else {
+                        console.log('⚠️ No tokens found in sync results');
+                    }
+                }
+            } catch (error) {
+                console.error('❌ Background sync failed:', error.message);
+            }
+            
+            // Schedule next sync in 10 minutes
+            setTimeout(syncLoop, 10 * 60 * 1000);
+        };
+        
+        // Start first sync immediately (non-blocking)
+        syncLoop();
+    }
+
+    // ★★★ NEW: Method to save tokens to database ★★★
+    async saveTokensToDatabase(playlistId, channels) {
+        try {
+            console.log(`💾 Saving tokens for ${channels.length} channels to database...`);
+            
+            const Channel = require('../models/Channel');
+            let tokenCount = 0;
+            const batchSize = 100;
+            
+            for (let i = 0; i < channels.length; i += batchSize) {
+                const batch = channels.slice(i, i + batchSize);
+                const bulkOps = [];
+                
+                for (const channel of batch) {
+                    if (channel.streamingToken || channel.streamUrl) {
+                        bulkOps.push({
+                            updateOne: {
+                                filter: { 
+                                    playlistId: playlistId,
+                                    channelId: channel.channelId 
+                                },
+                                update: {
+                                    $set: {
+                                        streamingToken: channel.streamingToken,
+                                        streamUrl: channel.streamUrl,
+                                        tokenUpdatedAt: new Date()
+                                    }
+                                }
+                            }
+                        });
+                        tokenCount++;
+                    }
+                }
+                
+                if (bulkOps.length > 0) {
+                    await Channel.bulkWrite(bulkOps, { ordered: false });
+                    console.log(`✅ Saved batch ${Math.floor(i/batchSize) + 1}: ${bulkOps.length} tokens`);
+                }
+            }
+            
+            console.log(`✅ Successfully saved ${tokenCount} tokens to database`);
+            return tokenCount;
+        } catch (error) {
+            console.error('❌ Failed to save tokens to database:', error.message);
+            return 0;
+        }
+    }
+
+    async getChannelToken(channelId) {
+        // Convert to string for consistent comparison
+        const searchId = String(channelId);
+        
+        // Check token cache first (MILLISECONDS)
+        const cached = this.tokenCache.get(searchId);
+        if (cached && (Date.now() - cached.timestamp < this.tokenCacheTTL)) {
+            console.log(`⚡ Token cache hit for channel ${searchId}:`, {
+                hasToken: !!cached.token,
+                hasUrl: !!cached.url,
+                token: cached.token ? cached.token.substring(0, 10) + '...' : 'none',
+                url: cached.url ? cached.url.substring(0, 50) + '...' : 'none'
+            });
+            return cached;
+        }
+        
+        // If not in cache, try to get from channels cache
+        if (this.channelsCache) {
+            // Try exact match first
+            let channel = this.channelsCache.find(c => String(c.channelId) === searchId);
+            
+            // If not found, try matching without leading/trailing spaces
+            if (!channel) {
+                channel = this.channelsCache.find(c => String(c.channelId).trim() === searchId.trim());
+            }
+            
+            if (channel?.streamingToken || channel?.streamUrl) {
+                const tokenData = {
+                    token: channel.streamingToken,
+                    url: channel.streamUrl,
+                    timestamp: Date.now()
+                };
+                this.tokenCache.set(searchId, tokenData);
+                console.log(`📦 Loaded from channels cache for ${searchId}:`, {
+                    hasToken: !!tokenData.token,
+                    hasUrl: !!tokenData.url,
+                    token: tokenData.token ? tokenData.token.substring(0, 10) + '...' : 'none'
+                });
+                return tokenData;
+            }
+        }
+        
+        console.log(`❌ Cache miss for channel ${searchId}`);
+        return null;
     }
 
     /**
@@ -564,68 +732,6 @@ class MagStalkerService {
         }
     }
 
-/**
- * Generate a fresh stream URL for a channel
- * This should be called every time a user wants to watch a channel
- */
-async getFreshStreamUrl(channelId, originalCmd) {
-    try {
-        console.log(`🔄 Getting fresh stream URL for channel: ${channelId}`);
-        
-        // Always do a fresh handshake
-        await this.handshake();
-        
-        // Try to get a fresh link using create_link
-        let freshCmd = null;
-        
-        // Try with original cmd first
-        if (originalCmd) {
-            console.log(`   Trying create_link with original command`);
-            freshCmd = await this.createLink(originalCmd);
-        }
-        
-        // If that fails, try with just channel ID
-        if (!freshCmd) {
-            console.log(`   Trying create_link with channel ID only`);
-            freshCmd = await this.createLink(channelId);
-        }
-        
-        if (freshCmd) {
-            console.log(`✅ Raw create_link response: ${freshCmd}`);
-            
-            // Extract the stream URL from the cmd
-            const urlMatch = freshCmd.match(/https?:\/\/[^\s"']+/);
-            if (urlMatch) {
-                const streamUrl = urlMatch[0];
-                console.log(`✅ Extracted stream URL: ${streamUrl}`);
-                
-                // Parse the URL to understand its structure
-                try {
-                    const urlObj = new URL(streamUrl);
-                    console.log(`   Stream domain: ${urlObj.hostname}`);
-                    console.log(`   Stream path: ${urlObj.pathname}`);
-                    console.log(`   Stream query params: ${urlObj.search}`);
-                    
-                    // Extract token from query params if present
-                    const tokenParam = urlObj.searchParams.get('token');
-                    if (tokenParam) {
-                        console.log(`   Token from query: ${tokenParam}`);
-                    }
-                } catch (e) {}
-                
-                return streamUrl;
-            }
-        }
-        
-        throw new Error('Could not generate fresh stream URL');
-        
-    } catch (error) {
-        console.error('❌ Failed to get fresh stream URL:', error.message);
-        throw error;
-    }
-}
-
-
     /**
      * Get channel link for streaming
      */
@@ -703,6 +809,21 @@ async getFreshStreamUrl(channelId, originalCmd) {
             
             console.log(`✅ Channels retrieved: ${channels.length} in ${(endTime - startTime) / 1000} seconds`);
 
+            // Update cache
+            this.channelsCache = channels;
+            this.cacheTimestamp = Date.now();
+            
+            // Update token cache
+            for (const channel of channels) {
+                if (channel.streamingToken || channel.streamUrl) {
+                    this.tokenCache.set(channel.channelId, {
+                        token: channel.streamingToken,
+                        url: channel.streamUrl,
+                        timestamp: Date.now()
+                    });
+                }
+            }
+
             return {
                 accountInfo: accountInfo.js || { status: 'ok' },
                 profile: profile?.js || null,
@@ -721,44 +842,35 @@ async getFreshStreamUrl(channelId, originalCmd) {
     }
 
     /**
-     * Get cached channel URL - FAST after first request
+     * Get cached channel data
      */
-    async getCachedChannelUrl(channelId) {
+    async getCachedChannelData(channelId) {
         try {
-            console.log(`🔍 Getting URL for channel: ${channelId}`);
+            console.log(`🔍 Getting cached data for channel: ${channelId}`);
+            
+            const now = Date.now();
             
             // Check if cache is valid
-            const now = Date.now();
             if (this.channelsCache && this.cacheTimestamp && (now - this.cacheTimestamp < this.cacheTTL)) {
                 console.log(`📦 Using cached channels (${this.channelsCache.length} channels)`);
                 
                 // Find channel in cache
                 const cachedChannel = this.channelsCache.find(c => c.channelId === String(channelId));
-                if (cachedChannel?.cmd) {
-                    const urlMatch = cachedChannel.cmd.match(/https?:\/\/[^\s]+/);
-                    console.log(`✅ Found in cache!`);
-                    return urlMatch ? urlMatch[0] : cachedChannel.cmd;
+                if (cachedChannel) {
+                    console.log(`✅ Found channel in cache: ${cachedChannel.name}`);
+                    return cachedChannel;
                 }
                 console.log(`⚠️ Channel ${channelId} not found in cache`);
             }
             
             // Cache expired or channel not found - do a fresh sync
-            console.log(`🔄 Cache miss, syncing all channels (this will take ~8 seconds once)...`);
+            console.log(`🔄 Cache miss, syncing all channels (this will take ~8-14 seconds)...`);
             const result = await this.syncAll();
             
-            // Update cache
-            this.channelsCache = result.channels || [];
-            this.cacheTimestamp = now;
-            console.log(`✅ Cached ${this.channelsCache.length} channels for 5 minutes`);
-            
             // Find the channel
-            const freshChannel = this.channelsCache.find(c => c.channelId === String(channelId));
-            if (freshChannel?.cmd) {
-                const urlMatch = freshChannel.cmd.match(/https?:\/\/[^\s]+/);
-                return urlMatch ? urlMatch[0] : freshChannel.cmd;
-            }
+            const freshChannel = result.channels.find(c => c.channelId === String(channelId));
+            return freshChannel || null;
             
-            return null;
         } catch (error) {
             console.error('❌ Cache error:', error.message);
             return null;
@@ -766,63 +878,74 @@ async getFreshStreamUrl(channelId, originalCmd) {
     }
 
     /**
-     * Transform channels to standard format
+     * Transform channels to standard format with token extraction
      */
-    transformChannels(channels) {
-        if (!channels || !Array.isArray(channels)) {
-            return [];
-        }
+// In magStalkerService.js - Modify transformChannels
 
-        return channels.map(channel => {
-            const channelId = channel.id || 
-                             channel.channel_id || 
-                             channel.channelId || 
-                             String(Math.random()).substring(2, 10);
-            
-            const name = channel.name || 
-                        channel.title || 
-                        channel.display_name || 
-                        'Unknown';
-            
-            // Get stream URL or command
-            let cmd = channel.cmd || channel.url || '';
-            
-            // If no cmd but we have an ID, generate stream URL
-            if (!cmd && channelId && channelId !== 'undefined') {
-                cmd = this.generateStreamUrl(channelId);
-            }
-            
-            const logo = channel.logo || 
-                        channel.icon || 
-                        channel.logo_uri || 
-                        '';
-            
-            // Get genre name from the map if available
-            const genreId = channel.tv_genre_id ? channel.tv_genre_id.toString() : 
-                           channel.genre_id ? channel.genre_id.toString() : null;
-            const genreName = this.genresMap?.get(genreId) || 
-                            channel.genre || 
-                            channel.group || 
-                            channel.category || 
-                            'Uncategorized';
-            
-            return {
-                channelId: String(channelId),
-                name: String(name),
-                originalName: String(name),
-                cmd: cmd,
-                logo: logo,
-                group: genreName,
-                tvGenreId: genreId,
-                isHd: channel.hd === 1 || channel.hd === '1' || false,
-                is4k: channel.hs === 4 || channel.hs === '4' || false,
-                useHttpTmpLink: channel.use_http_tmp_link === 1 || false,
-                ageRestricted: channel.censored === 1 || false,
-                sourceType: 'mag'
-            };
-        });
+transformChannels(channels) {
+    if (!channels || !Array.isArray(channels)) {
+        return [];
     }
 
+    return channels.map(channel => {
+        const channelId = channel.id || 
+                        channel.channel_id || 
+                        channel.channelId || 
+                        String(Math.random()).substring(2, 10);
+        
+        const name = channel.name || 
+                    channel.title || 
+                    channel.display_name || 
+                    'Unknown';
+        
+        // Get stream URL or command
+        let cmd = channel.cmd || channel.url || '';
+        
+        // Extract the REAL streaming token from the channel data
+        // The portal returns the correct token in the channel object!
+        let streamingToken = channel.password || channel.streaming_token || null;
+        let streamUrl = null;
+        
+        // If we have a URL in cmd, extract it
+        const urlMatch = cmd.match(/https?:\/\/[^\s]+/);
+        if (urlMatch) {
+            streamUrl = urlMatch[0];
+        }
+        
+        const logo = channel.logo || 
+                    channel.icon || 
+                    channel.logo_uri || 
+                    '';
+        
+        // Get genre name from the map if available
+        const genreId = channel.tv_genre_id ? channel.tv_genre_id.toString() : 
+                    channel.genre_id ? channel.genre_id.toString() : null;
+        const genreName = this.genresMap?.get(genreId) || 
+                        channel.genre || 
+                        channel.group || 
+                        channel.category || 
+                        'Uncategorized';
+        
+        return {
+            channelId: String(channelId),
+            name: String(name),
+            originalName: String(name),
+            cmd: cmd,
+            logo: logo,
+            group: genreName,
+            tvGenreId: genreId,
+            isHd: channel.hd === 1 || channel.hd === '1' || false,
+            is4k: channel.hs === 4 || channel.hs === '4' || false,
+            useHttpTmpLink: channel.use_http_tmp_link === 1 || false,
+            ageRestricted: channel.censored === 1 || false,
+            sourceType: 'mag',
+            macAddress: this.macAddress,
+            // ★★★ CRITICAL: Store the REAL password from the portal ★★★
+            streamingToken: streamingToken,
+            streamUrl: streamUrl
+        };
+    });
+}
     /**
      * Parse MAG response (handles JavaScript wrapped responses)
      */
