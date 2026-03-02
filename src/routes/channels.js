@@ -549,56 +549,35 @@ router.post('/get-stream', auth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /channels/release-stream - Client requests stream release
 // ★★★ COMPLETELY FIXED VERSION ★★★
+// In channels.js - make release-stream super simple
+// In backend/routes/channels.js
 router.post('/release-stream', auth, async (req, res) => {
-  const { playlistId, channelId, cmd } = req.body;
+  const { playlistId, channelId, cmd, macAddress } = req.body;
+  
+  console.log(`🔓 Releasing channel ${channelId} for MAC: ${macAddress}`);
   
   try {
-    console.log(`🔓 Client requested release for channel ${channelId}`);
+    // Get the playlist to get MAC if not provided
+    let mac = macAddress;
+    if (!mac && playlistId) {
+      const playlist = await Playlist.findById(playlistId).lean();
+      mac = playlist?.macAddress;
+    }
     
-    const playlist = await Playlist.findById(playlistId).lean();
-    if (!playlist) return res.json({ success: true });
-    
-    // Only proceed for MAG portals
-    if (playlist.type === 'mag' || playlist.type === 'stalker') {
-      // Try to do a proper release on the portal
-      try {
-        // Quick handshake to get a token
-        const { token, apiPath } = await doHandshake(playlist.sourceUrl, playlist.macAddress)
-          .catch(() => ({ token: null, apiPath: API_PATHS[0] }));
-        
-        if (token) {
-          await doReleaseStream(playlist.sourceUrl, apiPath, playlist.macAddress, token, cmd);
-        }
-      } catch (e) {
-        console.log('⚠️ Release handshake failed:', e.message);
-      }
-
-      // ★★★ CRITICAL: Force kill any active stream for this MAC ★★★
-      try {
-        const axios = require('axios');
-        const proxyUrl = `http://localhost:${process.env.PORT || 5000}/api/proxy/stream/${playlist.macAddress}/${channelId}`;
-        
-        console.log(`🔫 Force killing stream via proxy: ${proxyUrl}`);
-        await axios.delete(proxyUrl, { timeout: 3000 }).catch(() => {});
-      } catch (e) {
-        console.log('⚠️ Proxy kill request failed (non-fatal):', e.message);
-      }
-
-      // Clear session and cache
-      const mac = playlist.macAddress;
-      if (mac) {
-        sessionMap.delete(mac);
-        console.log(`🗑️ Cleared stale session for MAC: ${mac}`);
-      }
-
-      linkCache.clear();
-      console.log(`🗑️ Cleared entire link cache after release`);
+    if (mac && channelId) {
+      // Call the proxy kill endpoint
+      const killUrl = `${process.env.BASE_URL || 'http://localhost:5000'}/api/proxy/stream/${encodeURIComponent(mac)}/${encodeURIComponent(channelId)}`;
+      
+      // Fire and forget - don't wait for response
+      axios.delete(killUrl).catch(() => {});
+      
+      console.log(`✅ Kill request sent for ${mac}/${channelId}`);
     }
     
     res.json({ success: true });
   } catch (error) {
-    console.error('Release stream error:', error);
-    res.json({ success: true }); // Always return success
+    console.error('Release error:', error);
+    res.json({ success: true }); // Still return success
   }
 });
 

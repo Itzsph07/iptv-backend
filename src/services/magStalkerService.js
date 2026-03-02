@@ -54,7 +54,7 @@ class MagStalkerService {
         this.currentApiPath = '/c/portal.php';
         
         // Start background sync
-        this._initBackgroundSync();
+     // this._initBackgroundSync();
     }
 
     _initBackgroundSync() {
