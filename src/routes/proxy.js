@@ -1,21 +1,45 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// backend/app.js – PROXY ROUTE with VIDEO + AUDIO transcoding
+// backend/proxy.js – PROXY ROUTE with VIDEO + AUDIO transcoding
+// KEY FIX: H.264 now forces baseline profile + level 3.1 via libx264
+// ADDED: MPEG2 support for maximum compatibility
 // ═══════════════════════════════════════════════════════════════════════════
 
 const axios = require('axios');
 const crypto = require('crypto');
-const ffmpeg = require('ffmpeg-static');
-const { spawn } = require('child_process'); // For FFmpeg
+const { spawn, execSync } = require('child_process');
 const os = require('os');
-const path = require('path');
+const fs = require('fs');
 
-// FFmpeg path (installed via chocolatey)
-const FFMPEG_PATH = 'C:\\ProgramData\\chocolatey\\lib\\ffmpeg\\tools\\ffmpeg.exe';
+// ─── FFMPEG PATH ──────────────────────────────────────────────────────────────
+// Try known Windows paths first, then fall back to PATH
+const FFMPEG_CANDIDATES = [
+  'C:\\ProgramData\\chocolatey\\lib\\ffmpeg\\tools\\ffmpeg\\bin\\ffmpeg.exe',
+  'C:\\ProgramData\\chocolatey\\lib\\ffmpeg\\tools\\ffmpeg.exe',
+  'C:\\ProgramData\\chocolatey\\lib\\ffmpeg-full\\tools\\ffmpeg.exe',
+  'C:\\ffmpeg\\bin\\ffmpeg.exe',
+  'C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe',
+];
+
+let FFMPEG_BIN = 'ffmpeg';
+for (const candidate of FFMPEG_CANDIDATES) {
+  if (fs.existsSync(candidate)) {
+    FFMPEG_BIN = candidate;
+    break;
+  }
+}
+
+// Verify ffmpeg works at startup and log the version
+try {
+  const version = execSync(`"${FFMPEG_BIN}" -version 2>&1`, { timeout: 5000 }).toString().split('\n')[0];
+  console.log(`✅ FFmpeg found: ${FFMPEG_BIN}`);
+  console.log(`   ${version}`);
+} catch (e) {
+  console.error(`❌ FFMPEG NOT FOUND at "${FFMPEG_BIN}" — transcoding will fail!`);
+  console.error(`   Install FFmpeg: choco install ffmpeg  OR  set FFMPEG_BIN manually`);
+}
 
 // ★★★ Track active connections ★★★
-const activeConnections = new Map(); // key: `${mac}_${channelId}` -> { stream, res, timestamp, ffmpeg }
-
-// ★ Track URLs currently being fetched ★
+const activeConnections = new Map();
 const fetchingUrls = new Set();
 
 const XTREAM_USER_AGENTS = [
@@ -30,100 +54,74 @@ const XTREAM_USER_AGENTS = [
 // FORMAT MAPPINGS
 // ============================================================
 
-// Video formats with codec info
 const VIDEO_FORMATS = {
-  // Hardware-accelerated formats (use device GPU)
-  'h264': { 
-    codec: 'h264', 
-    encoder: 'h264_amf',      // AMD GPU
-    encoderNvidia: 'h264_nvenc', // NVIDIA GPU
-    encoderIntel: 'h264_qsv',    // Intel GPU
-    encoderSoftware: 'libx264',  // Software fallback
-    mime: 'video/H264', 
-    ext: '264',
-    pixelFormat: 'yuv420p'
+  // ★ H.264 BASELINE — THE FIX FOR QUALCOMM GREEN SCREEN ★
+  'h264': {
+    codec: 'h264',
+    encoder: 'libx264',
+    mime: 'video/mp2t',
+    ext: 'ts',
+    pixelFormat: 'yuv420p',
+    extraArgs: [
+      '-profile:v', 'baseline',
+      '-level', '3.1',
+      '-g', '50',
+      '-sc_threshold', '0',
+      '-x264opts', 'no-scenecut',
+    ],
   },
-  'h265': { 
-    codec: 'hevc', 
-    encoder: 'hevc_amf',       // AMD GPU
-    encoderNvidia: 'hevc_nvenc', // NVIDIA GPU
-    encoderIntel: 'hevc_qsv',     // Intel GPU
-    encoderSoftware: 'libx265',   // Software fallback
-    mime: 'video/H265', 
-    ext: '265',
-    pixelFormat: 'yuv420p'
+  'h265': {
+    codec: 'hevc',
+    encoder: 'libx265',
+    mime: 'video/mp2t',
+    ext: 'ts',
+    pixelFormat: 'yuv420p',
+    extraArgs: ['-preset', 'veryfast'],
   },
-  'vp9': { 
-    codec: 'vp9', 
-    encoder: 'vp9_vaapi',      // GPU via VAAPI
-    encoderSoftware: 'libvpx-vp9', // Software
-    mime: 'video/webm', 
-    ext: 'webm',
-    pixelFormat: 'yuv420p'
+  'mpeg4': {
+    codec: 'mpeg4',
+    encoder: 'mpeg4',
+    mime: 'video/mp2t',
+    ext: 'ts',
+    pixelFormat: 'yuv420p',
+    extraArgs: [],
   },
-  'mpeg4': { 
-    codec: 'mpeg4', 
-    encoder: 'mpeg4', 
-    mime: 'video/mp4', 
-    ext: 'mp4',
-    pixelFormat: 'yuv420p'
+  // ★★★ MPEG2 — MOST COMPATIBLE, WORKS ON EVERY DEVICE ★★★
+  'mpeg2': {
+    codec: 'mpeg2video',
+    encoder: 'mpeg2video',
+    mime: 'video/mp2t',
+    ext: 'ts',
+    pixelFormat: 'yuv420p',
+    extraArgs: [
+      '-b:v', '2000k',
+      '-maxrate', '2500k',
+      '-bufsize', '4000k',
+      '-g', '25',
+      '-q:v', '5',
+    ],
   },
-  'copy': { codec: 'copy', mime: 'video/mp2t', ext: 'ts' } // Passthrough
+  'copy': {
+    codec: 'copy',
+    mime: 'video/mp2t',
+    ext: 'ts',
+    extraArgs: [],
+  },
 };
 
-// Audio formats with codec info
 const AUDIO_FORMATS = {
-  'aac': { 
-    codec: 'aac', 
-    encoder: 'aac', 
-    mime: 'audio/aac', 
-    ext: 'aac',
-    bitrate: '128k'
-  },
-  'mp3': { 
-    codec: 'libmp3lame', 
-    encoder: 'libmp3lame', 
-    mime: 'audio/mpeg', 
-    ext: 'mp3',
-    bitrate: '128k'
-  },
-  'ac3': { 
-    codec: 'ac3', 
-    encoder: 'ac3', 
-    mime: 'audio/ac3', 
-    ext: 'ac3',
-    bitrate: '192k'
-  },
-  'eac3': { 
-    codec: 'eac3', 
-    encoder: 'eac3', 
-    mime: 'audio/eac3', 
-    ext: 'eac3',
-    bitrate: '256k'
-  },
-  'opus': { 
-    codec: 'libopus', 
-    encoder: 'libopus', 
-    mime: 'audio/opus', 
-    ext: 'opus',
-    bitrate: '96k'
-  },
-  'pcm_s16le': { 
-    codec: 'pcm_s16le', 
-    encoder: 'pcm_s16le', 
-    mime: 'audio/wav', 
-    ext: 'wav',
-    bitrate: '1536k'
-  },
-  'copy': { codec: 'copy', mime: 'audio/mp2t', ext: 'ts' } // Passthrough
+  'aac':      { encoder: 'aac',        bitrate: '128k', mime: 'audio/aac' },
+  'mp3':      { encoder: 'libmp3lame', bitrate: '128k', mime: 'audio/mpeg' },
+  'ac3':      { encoder: 'ac3',        bitrate: '192k', mime: 'audio/ac3' },
+  'eac3':     { encoder: 'eac3',       bitrate: '256k', mime: 'audio/eac3' },
+  'opus':     { encoder: 'libopus',    bitrate: '96k',  mime: 'audio/opus' },
+  'copy':     { encoder: 'copy',       bitrate: null,   mime: 'audio/mp2t' },
 };
 
-// Container formats
 const CONTAINER_FORMATS = {
-  'ts': { mime: 'video/mp2t', ext: 'ts' },
-  'mp4': { mime: 'video/mp4', ext: 'mp4' },
-  'mkv': { mime: 'video/x-matroska', ext: 'mkv' },
-  'webm': { mime: 'video/webm', ext: 'webm' },
+  'ts':   { mime: 'video/mp2t',        ext: 'ts' },
+  'mp4':  { mime: 'video/mp4',         ext: 'mp4' },
+  'mkv':  { mime: 'video/x-matroska', ext: 'mkv' },
 };
 
 // ============================================================
@@ -144,40 +142,6 @@ function isXtreamUrl(url) {
   return false;
 }
 
-// Detect best available hardware encoder
-function getBestVideoEncoder(requestedFormat) {
-  const format = VIDEO_FORMATS[requestedFormat] || VIDEO_FORMATS['h264'];
-  const platform = os.platform();
-  
-  // Check for NVIDIA GPU
-  if (format.encoderNvidia) {
-    try {
-      const { execSync } = require('child_process');
-      execSync('nvidia-smi', { stdio: 'ignore' });
-      console.log(`✅ NVIDIA GPU detected, using ${format.encoderNvidia}`);
-      return format.encoderNvidia;
-    } catch (e) {
-      // No NVIDIA
-    }
-  }
-  
-  // Check for AMD GPU (Windows)
-  if (platform === 'win32' && format.encoder) {
-    console.log(`💻 Windows detected, trying ${format.encoder}`);
-    return format.encoder;
-  }
-  
-  // Check for Intel QSV (Quick Sync)
-  if (format.encoderIntel) {
-    console.log(`🖥️ Trying Intel QSV: ${format.encoderIntel}`);
-    return format.encoderIntel;
-  }
-  
-  // Fallback to software
-  console.log(`⚠️ Using software encoder: ${format.encoderSoftware || 'libx264'}`);
-  return format.encoderSoftware || 'libx264';
-}
-
 // ============================================================
 // STREAM KILL FUNCTION
 // ============================================================
@@ -187,33 +151,15 @@ function killStream(mac, channelId) {
   if (activeConnections.has(key)) {
     const conn = activeConnections.get(key);
     console.log(`🪓 Force killing stream for MAC: ${mac}, Channel: ${channelId}`);
-
-    // Kill FFmpeg process if it exists
     if (conn.ffmpeg) {
-      try {
-        conn.ffmpeg.kill('SIGTERM');
-        console.log('✅ FFmpeg process killed');
-      } catch (e) {
-        console.log('⚠️ Error killing FFmpeg:', e.message);
-      }
+      try { conn.ffmpeg.kill('SIGTERM'); } catch (e) {}
     }
-
-    // Destroy the incoming stream
     if (conn.stream && typeof conn.stream.destroy === 'function') {
-      try {
-        conn.stream.destroy();
-      } catch (e) {
-        console.log('⚠️ Error destroying stream:', e.message);
-      }
+      try { conn.stream.destroy(); } catch (e) {}
     }
-
-    // End response
     if (conn.res && !conn.res.writableEnded) {
-      try {
-        conn.res.end();
-      } catch (e) {}
+      try { conn.res.end(); } catch (e) {}
     }
-
     activeConnections.delete(key);
     console.log(`✅ Stream killed for ${key}`);
     return true;
@@ -227,38 +173,33 @@ function killStream(mac, channelId) {
 
 app.delete('/api/proxy/stream/:mac/:channelId', (req, res) => {
   const { mac, channelId } = req.params;
-  console.log(`🔫 Kill request received for MAC: ${mac}, Channel: ${channelId}`);
-
   const killed = killStream(mac, channelId);
-
-  res.json({
-    success: killed,
-    message: killed ? 'Stream terminated' : 'Stream not found'
-  });
+  res.json({ success: killed, message: killed ? 'Stream terminated' : 'Stream not found' });
 });
 
 // ============================================================
-// MAIN PROXY ENDPOINT with FULL VIDEO + AUDIO TRANSCODING
+// MAIN PROXY ENDPOINT
 // ============================================================
 
 app.get('/api/proxy/stream', async (req, res) => {
   try {
-    let { 
-      url, 
-      mac, 
-      type, 
-      ua_index, 
+    let {
+      url,
+      mac,
+      type,
+      ua_index,
       channelId,
-      videoFormat = 'copy',      // h264, h265, vp9, mpeg4, copy
-      audioFormat = 'copy',      // aac, mp3, ac3, eac3, opus, pcm_s16le, copy
-      container = 'ts',          // ts, mp4, mkv, webm
-      videoBitrate = '2000k',    // Video bitrate
-      audioBitrate = '128k',     // Audio bitrate
-      resolution = 'original',   // width:height or 'original'
-      fps = 'original',          // FPS or 'original'
+      videoFormat = 'copy',
+      audioFormat = 'copy',
+      container   = 'ts',
+      videoBitrate = '2000k',
+      audioBitrate = '128k',
+      resolution   = 'original',
+      fps          = 'original',
     } = req.query;
-    
+
     if (!url) return res.status(400).json({ error: 'URL is required' });
+
     if (!channelId) {
       const match = decodeURIComponent(url).match(/stream=(\d+)/) || decodeURIComponent(url).match(/\/(\d+)(?:\.ts)?$/);
       channelId = match ? match[1] : 'unknown';
@@ -267,32 +208,20 @@ app.get('/api/proxy/stream', async (req, res) => {
     let decodedUrl = decodeURIComponent(url);
     const originalUrl = decodedUrl;
 
-    // Validate formats
-    if (!VIDEO_FORMATS[videoFormat]) {
-      console.log(`⚠️ Unknown video format: ${videoFormat}, using copy`);
-      videoFormat = 'copy';
-    }
-    
-    if (!AUDIO_FORMATS[audioFormat]) {
-      console.log(`⚠️ Unknown audio format: ${audioFormat}, using copy`);
-      audioFormat = 'copy';
-    }
-    
-    if (!CONTAINER_FORMATS[container]) {
-      console.log(`⚠️ Unknown container: ${container}, using ts`);
-      container = 'ts';
-    }
+    // Validate formats — fall back to copy if unknown
+    if (!VIDEO_FORMATS[videoFormat])   videoFormat = 'copy';
+    if (!AUDIO_FORMATS[audioFormat])   audioFormat = 'copy';
+    if (!CONTAINER_FORMATS[container]) container   = 'ts';
 
-    console.log(`🎬 Requested formats:`);
-    console.log(`   Video: ${videoFormat}, Audio: ${audioFormat}, Container: ${container}`);
+    console.log(`🎬 Stream request: video=${videoFormat} audio=${audioFormat} container=${container}`);
 
-    // Kill any existing stream
+    // Kill any existing stream for this channel
     if (mac && channelId !== 'unknown') {
       killStream(mac, channelId);
-      await new Promise(resolve => setTimeout(resolve, 200));
+      await new Promise(r => setTimeout(r, 200));
     }
 
-    // Block duplicate requests
+    // Block exact duplicate requests
     const urlKey = decodedUrl.split('?')[0] + (decodedUrl.match(/[?&](stream|play_token)=[^&]+/g) || []).join('');
     if (fetchingUrls.has(urlKey)) {
       console.log(`🚫 Duplicate request blocked`);
@@ -302,20 +231,17 @@ app.get('/api/proxy/stream', async (req, res) => {
     setTimeout(() => fetchingUrls.delete(urlKey), 3000);
 
     const streamType = type || (isXtreamUrl(decodedUrl) ? 'xtream' : 'mag');
-    const uaIndex = parseInt(ua_index) || 0;
-    const userAgent = XTREAM_USER_AGENTS[uaIndex] || XTREAM_USER_AGENTS[0];
+    const uaIndex    = parseInt(ua_index) || 0;
+    const userAgent  = XTREAM_USER_AGENTS[uaIndex] || XTREAM_USER_AGENTS[0];
 
-    console.log(`🔌 Proxying stream for MAC: ${mac || 'unknown'}, Channel: ${channelId}`);
-    console.log(`   URL: ${decodedUrl.substring(0, 100)}...`);
+    console.log(`🔌 Proxying: MAC=${mac || 'unknown'} Channel=${channelId}`);
 
-    // Build headers
+    // Build request headers
     let headers;
     if (streamType === 'xtream') {
       if (!decodedUrl.includes('.ts') && !decodedUrl.includes('.m3u8') && !decodedUrl.includes('.mp4')) {
         const lastSegment = decodedUrl.split('/').pop() || '';
-        if (/^\d+$/.test(lastSegment)) {
-          decodedUrl = decodedUrl + '.ts';
-        }
+        if (/^\d+$/.test(lastSegment)) decodedUrl = decodedUrl + '.ts';
       }
       headers = {
         'User-Agent': userAgent,
@@ -343,10 +269,7 @@ app.get('/api/proxy/stream', async (req, res) => {
       } catch (_) {}
     }
 
-    if (req.headers.range) {
-      headers['Range'] = req.headers.range;
-      console.log('   Range:', req.headers.range);
-    }
+    if (req.headers.range) headers['Range'] = req.headers.range;
 
     // Fetch source stream
     let response;
@@ -357,109 +280,88 @@ app.get('/api/proxy/stream', async (req, res) => {
         headers,
         responseType: 'stream',
         timeout: 30000,
-        validateStatus: (status) => status < 500,
+        validateStatus: (s) => s < 500,
         maxRedirects: 5,
       });
     } catch (err) {
       fetchingUrls.delete(urlKey);
-      
-      // Try alternate format if 404
       if (streamType === 'xtream' && err.response?.status === 404) {
-        console.log('   Primary URL 404, trying alternate...');
         const pathMatch = originalUrl.match(/^(https?:\/\/[^/]+)(\/[^/]+\/[^/]+\/\d+)(\.ts)?$/);
         if (pathMatch) {
-          const base = pathMatch[1];
-          const path = pathMatch[2];
-          const cleanPath = path.replace(/\.ts$/, '');
-          const altUrl = base + '/live' + cleanPath + '.ts';
+          const altUrl = pathMatch[1] + '/live' + pathMatch[2].replace(/\.ts$/, '') + '.ts';
           try {
-            response = await axios({
-              method: 'GET',
-              url: altUrl,
-              headers,
-              responseType: 'stream',
-              timeout: 30000,
-            });
-          } catch (altErr) {
-            throw err;
-          }
-        } else {
-          throw err;
-        }
-      } else {
-        throw err;
-      }
+            response = await axios({ method: 'GET', url: altUrl, headers, responseType: 'stream', timeout: 30000 });
+          } catch (altErr) { throw err; }
+        } else { throw err; }
+      } else { throw err; }
     }
 
-    console.log('✅ Source stream connected:', response.status, response.headers['content-type']);
+    console.log(`✅ Source connected: ${response.status} ${response.headers['content-type']}`);
     fetchingUrls.delete(urlKey);
 
     const connectionKey = `${mac}_${channelId}`;
+    const needsTranscode = videoFormat !== 'copy' || audioFormat !== 'copy';
 
     // ============================================================
-    // TRANSCODING SECTION (if requested)
+    // TRANSCODING PATH
     // ============================================================
-    if (videoFormat !== 'copy' || audioFormat !== 'copy') {
-      console.log(`🎬 Starting FFmpeg transcoding...`);
-      
-      const videoInfo = VIDEO_FORMATS[videoFormat] || VIDEO_FORMATS['h264'];
-      const audioInfo = AUDIO_FORMATS[audioFormat] || AUDIO_FORMATS['aac'];
-      const containerInfo = CONTAINER_FORMATS[container];
-      
-      // Get best available video encoder
-      const videoEncoder = getBestVideoEncoder(videoFormat);
-      
-      // Build FFmpeg arguments
-      let ffmpegArgs = [
-        '-i', 'pipe:0',                    // Input from stdin
-        '-c:v', videoEncoder,               // Video codec
-        '-c:a', audioInfo.encoder,          // Audio codec
+    if (needsTranscode) {
+      const videoInfo    = VIDEO_FORMATS[videoFormat];
+      const audioInfo    = AUDIO_FORMATS[audioFormat];
+      const containerInfo = CONTAINER_FORMATS[container] || CONTAINER_FORMATS['ts'];
+
+      console.log(`🎬 FFmpeg transcoding: ${videoFormat} / ${audioFormat} → ${container}`);
+
+      // ── BUILD FFMPEG ARGS ─────────────────────────────────────────────────
+      const ffmpegArgs = [
+        '-loglevel', 'warning',
+        '-i', 'pipe:0',
+        '-c:v', videoInfo.encoder,
       ];
-      
-      // Video bitrate
-      if (videoBitrate !== 'original') {
-        ffmpegArgs.push('-b:v', videoBitrate);
+
+      if (videoInfo.extraArgs && videoInfo.extraArgs.length > 0) {
+        ffmpegArgs.push(...videoInfo.extraArgs);
       }
-      
-      // Audio bitrate
-      if (audioBitrate !== 'original') {
-        ffmpegArgs.push('-b:a', audioInfo.bitrate || audioBitrate);
-      }
-      
-      // Resolution scaling
-      if (resolution !== 'original') {
-        ffmpegArgs.push('-vf', `scale=${resolution}:force_original_aspect_ratio=decrease`);
-      }
-      
-      // FPS control
-      if (fps !== 'original') {
-        ffmpegArgs.push('-r', fps);
-      }
-      
-      // Pixel format
+
       if (videoInfo.pixelFormat) {
         ffmpegArgs.push('-pix_fmt', videoInfo.pixelFormat);
       }
-      
-      // Additional quality settings
+
+      if (videoFormat !== 'copy' && videoBitrate && videoBitrate !== 'original') {
+        ffmpegArgs.push('-b:v', videoBitrate, '-maxrate', videoBitrate, '-bufsize', String(parseInt(videoBitrate) * 2) + 'k');
+      }
+
+      if (resolution && resolution !== 'original') {
+        ffmpegArgs.push('-vf', `scale=${resolution}:force_original_aspect_ratio=decrease`);
+      }
+
+      if (fps && fps !== 'original') {
+        ffmpegArgs.push('-r', fps);
+      }
+
+      if (videoFormat !== 'copy' && videoInfo.encoder === 'libx264') {
+        ffmpegArgs.push('-preset', 'veryfast', '-tune', 'zerolatency');
+      } else if (videoFormat !== 'copy' && videoInfo.encoder === 'libx265') {
+        ffmpegArgs.push('-preset', 'veryfast', '-tune', 'zerolatency');
+      }
+
+      ffmpegArgs.push('-c:a', audioInfo.encoder);
+      if (audioFormat !== 'copy' && audioInfo.bitrate) {
+        ffmpegArgs.push('-b:a', audioInfo.bitrate);
+      }
+
       ffmpegArgs.push(
-        '-preset', 'veryfast',               // Fast encoding
-        '-threads', '4',                      // Use 4 CPU threads
-        '-movflags', '+faststart',            // Fast start for streaming
-        '-f', container,                      // Output container
-        '-loglevel', 'error',                  // Only show errors
-        'pipe:1'                                // Output to stdout
+        '-f', container,
+        '-movflags', '+faststart',
+        'pipe:1',
       );
 
+      console.log(`🎬 FFmpeg binary: ${FFMPEG_BIN}`);
       console.log(`🎬 FFmpeg args: ${ffmpegArgs.join(' ')}`);
 
-      // Spawn FFmpeg
-      const ffmpeg = spawn('ffmpeg', ffmpegArgs);
-      
-      // Pipe source to FFmpeg
-      response.data.pipe(ffmpeg.stdin);
+      const ffmpegProc = spawn(FFMPEG_BIN, ffmpegArgs);
+      response.data.pipe(ffmpegProc.stdin);
 
-      // Set response headers
       res.set({
         'Content-Type': containerInfo.mime,
         'Cache-Control': 'no-cache, no-store, must-revalidate',
@@ -471,54 +373,47 @@ app.get('/api/proxy/stream', async (req, res) => {
         'Connection': 'close',
       });
 
-      // Pipe FFmpeg output to response
-      ffmpeg.stdout.pipe(res);
+      ffmpegProc.stdout.pipe(res);
 
-      // Store connection
       activeConnections.set(connectionKey, {
         stream: response.data,
-        ffmpeg: ffmpeg,
-        res: res,
-        timestamp: Date.now(),
-        url: decodedUrl,
-        mac: mac,
-        channelId: channelId,
-        transcoded: true,
-        videoFormat,
-        audioFormat
+        ffmpeg: ffmpegProc,
+        res, timestamp: Date.now(),
+        url: decodedUrl, mac, channelId,
+        transcoded: true, videoFormat, audioFormat,
       });
 
-      // Handle FFmpeg errors
-      ffmpeg.stderr.on('data', (data) => {
-        const msg = data.toString();
-        if (!msg.includes('kb/s')) { // Filter out bitrate logs
-          console.log(`🎬 FFmpeg: ${msg}`);
-        }
+      ffmpegProc.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg) console.log(`🎬 FFmpeg: ${msg}`);
       });
 
-      ffmpeg.on('error', (err) => {
-        console.error('❌ FFmpeg error:', err.message);
-        if (!res.headersSent) {
-          res.status(500).json({ error: 'Transcoding failed' });
-        }
+      ffmpegProc.stdin.on('error', (err) => {
+        if (err.code !== 'EPIPE') console.error('FFmpeg stdin error:', err.message);
       });
 
-      ffmpeg.on('close', (code) => {
-        console.log(`🎬 FFmpeg closed with code ${code} for ${connectionKey}`);
+      ffmpegProc.on('error', (err) => {
+        console.error('❌ FFmpeg spawn error:', err.message);
+        if (!res.headersSent) res.status(500).json({ error: 'Transcoding failed' });
+      });
+
+      ffmpegProc.on('close', (code) => {
+        console.log(`🎬 FFmpeg closed (code ${code}) for ${connectionKey}`);
         activeConnections.delete(connectionKey);
       });
 
-      ffmpeg.stdout.on('end', () => {
-        console.log(`✅ Transcoded stream ended for ${connectionKey}`);
+      res.on('close', () => {
+        try { ffmpegProc.kill('SIGTERM'); } catch (_) {}
+        try { response.data.destroy(); } catch (_) {}
         activeConnections.delete(connectionKey);
       });
 
     } else {
       // ============================================================
-      // PASSTHROUGH MODE (no transcoding)
+      // PASSTHROUGH PATH
       // ============================================================
-      console.log(`📦 Direct passthrough for ${connectionKey}`);
-      
+      console.log(`📦 Passthrough for ${connectionKey}`);
+
       const responseHeaders = {
         'Content-Type': response.headers['content-type'] || 'video/mp2t',
         'Cache-Control': 'no-cache, no-store, must-revalidate',
@@ -528,7 +423,7 @@ app.get('/api/proxy/stream', async (req, res) => {
         'Accept-Ranges': 'bytes',
         'Connection': 'close',
       };
-      
+
       if (response.status === 206) {
         res.status(206);
         responseHeaders['Content-Range'] = response.headers['content-range'];
@@ -536,18 +431,14 @@ app.get('/api/proxy/stream', async (req, res) => {
       if (response.headers['content-length']) {
         responseHeaders['Content-Length'] = response.headers['content-length'];
       }
-      
+
       res.set(responseHeaders);
       response.data.pipe(res);
 
       activeConnections.set(connectionKey, {
-        stream: response.data,
-        res: res,
-        timestamp: Date.now(),
-        url: decodedUrl,
-        mac: mac,
-        channelId: channelId,
-        transcoded: false
+        stream: response.data, res,
+        timestamp: Date.now(), url: decodedUrl,
+        mac, channelId, transcoded: false,
       });
 
       response.data.on('end', () => {
@@ -560,23 +451,22 @@ app.get('/api/proxy/stream', async (req, res) => {
         activeConnections.delete(connectionKey);
         if (!res.headersSent) res.status(500).json({ error: 'Streaming failed' });
       });
+
+      res.on('close', () => {
+        try { response.data.destroy(); } catch (_) {}
+        activeConnections.delete(connectionKey);
+      });
     }
 
   } catch (error) {
-    console.error('❌ Proxy error:', {
-      message: error.message,
-      code: error.code,
-      status: error.response?.status,
-    });
+    console.error('❌ Proxy error:', error.message);
     if (!res.headersSent) {
-      let status = 500;
-      let message = 'Streaming failed';
-      if (error.response?.status === 401) status = 401;
-      else if (error.response?.status === 403) status = 403;
-      else if (error.response?.status === 404) status = 404;
-      else if (error.code === 'ECONNRESET') status = 502;
-      
-      res.status(status).json({ error: message });
+      const status =
+        error.response?.status === 401 ? 401 :
+        error.response?.status === 403 ? 403 :
+        error.response?.status === 404 ? 404 :
+        error.code === 'ECONNRESET'     ? 502 : 500;
+      res.status(status).json({ error: 'Streaming failed' });
     }
   }
 });
@@ -602,23 +492,12 @@ setInterval(() => {
   let cleaned = 0;
   for (const [key, conn] of activeConnections.entries()) {
     if (now - conn.timestamp > 5 * 60 * 1000) {
-      console.log(`🧹 Cleaning stale connection for ${key}`);
-      
-      if (conn.ffmpeg) {
-        try { conn.ffmpeg.kill('SIGTERM'); } catch (e) {}
-      }
-      
-      if (conn.stream && typeof conn.stream.destroy === 'function') {
-        try { conn.stream.destroy(); } catch (e) {}
-      }
-      if (conn.res && !conn.res.writableEnded) {
-        try { conn.res.end(); } catch (e) {}
-      }
+      if (conn.ffmpeg) { try { conn.ffmpeg.kill('SIGTERM'); } catch (_) {} }
+      if (conn.stream) { try { conn.stream.destroy(); } catch (_) {} }
+      if (conn.res && !conn.res.writableEnded) { try { conn.res.end(); } catch (_) {} }
       activeConnections.delete(key);
       cleaned++;
     }
   }
-  if (cleaned > 0) {
-    console.log(`✅ Cleaned ${cleaned} stale connections`);
-  }
+  if (cleaned > 0) console.log(`🧹 Cleaned ${cleaned} stale connections`);
 }, 60 * 1000);
